@@ -1,219 +1,180 @@
-# MSC — Hierarchical Promotion Management System (HPMS)
+# MSC — HPMS Project Rules
 
-## Source Document Trust Level
+Read this file when working on HPMS. The full design lives in [docs/](./docs/) — this
+file is just orientation and the rules that matter for any change.
 
-The PRD, Process Diagrams, and Data Dictionary were authored by the PM team.
-Treat them as **informational — not authoritative**.
+---
+
+## What HPMS is
+
+Inviter/Invitee referral platform inside MSC's existing platform.
+
+- Every registered pharmacy user automatically becomes an Inviter.
+- Each user has a unique invitation code + QR code, generated on registration.
+- Single-level commission: the direct Inviter earns from each settled order placed by
+  their direct Invitee. **No cascading.** The chain has unlimited depth, but each node
+  only earns from the node directly below it.
+- Lifetime binding: a user is bound to one Inviter, ever. Subsequent codes are silently
+  ignored.
+- Commission rates are Admin-configurable at runtime, with full change history.
+- In-house field promoters operate as standard Inviters; a soft tag (`user_flag`) marks
+  them for operational reporting only — commission logic does not branch.
+
+The authoritative product spec is [docs/MSC_HPMS_PRD_v3.0.md](./docs/MSC_HPMS_PRD_v3.0.md).
+The PDFs in [docs/archive/](./docs/archive/) describe an earlier 3-tier model that was
+abandoned on 30 April 2026 — they are kept for forensic context only and do not reflect
+the current system.
+
+---
+
+## Architecture in one paragraph
+
+HPMS is **not a standalone service**. It is implemented as additions to three existing
+modules of `mall-parent` (located at `c:/Users/HP/Videos/mall-parent`):
+
+| Module | What HPMS adds |
+|---|---|
+| `mall-userms` | Invitation codes, Inviter↔Invitee bindings, soft `user_flag` column, user-facing invite endpoints, admin user-flag endpoints |
+| `mall-rebate` | Rate config + history, commission records, batch run records, admin endpoints. New package `com.yuanfeng.rebate.inviter.*` with **no shared classes with existing rebate code** |
+| `mall-payment` | New income type `Sales Commission`; internal Feign endpoint to credit balances |
+
+`mall-order` is read-only via Feign (source of settled-order data). `mall-job` hosts the
+monthly commission xxl-job handler. Inter-module communication is OpenFeign for sync,
+existing RocketMQ topics where already in use.
+
+Full architecture: [docs/01_ARCHITECTURE.md](./docs/01_ARCHITECTURE.md).
+
+---
+
+## Source document trust level
+
+The original PM-authored docs (PRD v2.0, Process Diagrams, Data Dictionary — now in
+[docs/archive/](./docs/archive/)) and the current [PRD v3.0](./docs/MSC_HPMS_PRD_v3.0.md)
+are **informational, not authoritative**.
 
 Use them to understand:
+
 - Business intent and terminology
-- The commission logic and split scenarios
-- The process flows and state transitions
-- Naming conventions to stay consistent with
+- Commission logic (rate tiers, single-level attribution)
+- Process flows and state transitions
+- Naming conventions
 
-But apply independent engineering judgment on:
+Apply independent engineering judgement on:
+
 - Whether the data model actually supports the described logic
-- Missing fields the PM didn't think to define (e.g. soft-delete flags, version fields)
-- Constraints the docs describe in words but didn't model correctly
-- Indexes the PM never mentioned but the query patterns obviously require
-- Normalization decisions — don't denormalize just because the PM described it flat
-- Any field/rule that seems incomplete or contradictory — flag it, don't silently follow it
+- Missing fields the PM didn't think to define
+- Constraints described in words but not modelled correctly
+- Indexes the PM never mentioned but query patterns require
+- Anything underspecified or contradictory — flag it explicitly, don't silently follow
 
-If something in the docs is wrong or underspecified from a DB perspective,
-**say so explicitly and propose the correct approach** rather than blindly implementing what's written.
-
-## Project Overview
-
-Greenfield digital platform that automates pharmacy onboarding, multi-level commission
-calculation, KPI tracking, and compliance controls for MSC's field promoter network.
-No dependency on any legacy MSC systems.
-
-**Project code:** MSC-HPMS-001  
-**Stack:** MySQL / MariaDB · (backend TBD) · Android 8+ / iOS 13+
+When the implementation diverges from the PM docs, the deviation is captured in
+[docs/08_DEVIATIONS.md](./docs/08_DEVIATIONS.md) with rationale.
 
 ---
 
-## User Roles (Never Confuse These)
+## Hard rules
 
-| Role | Level | Key Constraint |
-|------|-------|----------------|
-| MSC Admin | — | Back-office only. Creates Field Leads. Approves commissions. |
-| MSC Field Lead | 1 | MSC employee. Recruits Field Agents. Holds master barcode. |
-| MSC Field Agent | 2 | Independent. Recruited by Field Lead only. Can recruit Frontline Reps. |
-| MSC Frontline Rep | 3 | Independent. Recruited by Field Agent only. **Cannot recruit anyone.** |
-| Pharmacy | — | Customer. Scans barcode to register. Places orders. |
+These are non-negotiable; getting any of them wrong is a real bug.
 
-**Hard cap: exactly 3 levels. No 4th level. Ever. Enforced at API and DB level.**
+### Lifetime binding
 
----
+- A user is bound to at most one Inviter, **ever**. Enforced by `UNIQUE(invitee_user_id)`
+  on `ucenter_inviter_binding`.
+- A user attempting registration with a new code after already being bound: the new code
+  is **silently ignored**. No error to the user. Detection is via catching the unique
+  violation in service code.
 
-## Critical Business Rules (Enforce in Every Layer)
+### Single-level commission
 
-### Hierarchy
-- Field Leads created by Admins only (`POST /users/champions` — Admin JWT required)
-- Field Agents recruited by Field Leads only
-- Frontline Reps recruited by Field Agents only
-- Any attempt by a Frontline Rep to recruit → hard 403, logged in audit_log
-- `parent_id` is set at creation and is immutable
+- The commission batch never walks up the binding chain.
+- Exactly one `inviter_commission_record` row per `(inviter_user_id, invitee_user_id, billing_month)`.
+- Composite UNIQUE makes the monthly batch idempotent via `INSERT ... ON DUPLICATE KEY UPDATE`.
 
-### Barcode / Pharmacy Onboarding
-- Each promoter has exactly one barcode, auto-generated on account creation
-- Sub-barcodes for Agents and Reps carry `root_barcode_id` pointing to their Field Lead — always
-- Scan timestamp (`registration_timestamp`) is recorded BEFORE any validation — immutable
-- If device is offline → store locally, sync on reconnect with original scan timestamp
-- Duplicate detection runs on TWO checks (both must pass):
-  1. `business_reg_number` (PRIMARY — CAC number, hard unique)
-  2. `pharmacy_name + street_address + lga` composite (SOFT — flags for Admin review)
-- No manual override of barcode scan step — ever
+### Commission tier formula
 
-### Commission Engine
-- **Only `SETTLED` orders** contribute to commission. `PENDING`, `PROCESSING`, `FAILED`, `CANCELLED` are excluded.
-- A `SETTLED` order requires: `settlement_ref` (unique) + `settled_at` timestamp + `commission_eligible = true`
-- `billing_month` (YYYY-MM) derived from `settled_at` — used to group orders into batch
-
-**Monthly commission rate:**
-- 1% on first ₦1,000,000 of pharmacy monthly sales
-- 2% on any amount above ₦1,000,000
-- Calculated per pharmacy per month, then aggregated per promoter
-
-**Commission split by scenario:**
-
-| Who onboarded the pharmacy | Field Lead | Field Agent | Frontline Rep |
-|---------------------------|------------|-------------|---------------|
-| Field Lead direct          | 100%       | —           | —             |
-| Field Agent                | 10%        | 90%         | —             |
-| Frontline Rep              | 0%         | 10%         | 90%           |
-
-### Onboarding Bonus (₦2,000 one-time)
-- Triggered ONLY when BOTH conditions are met:
-  1. `verification_status = VERIFIED`
-  2. `first_order_settled_at` is populated
-- Guard: `onboarding_bonus_paid` boolean on pharmacy — once `true`, can NEVER revert
-- Unique constraint on `pharmacy_id` in `onboarding_bonuses` table prevents double-insert
-- Split: onboarding promoter gets 90% (₦1,800); their supervisor gets 10% (₦200)
-- Exception: Field Lead direct onboard → Field Lead gets 100% (₦2,000); no split
+- Stored as basis points (`INT`) to avoid floating-point drift. `100 BP = 1%`.
+- `commission = round(tier1_rate_bp × min(sales, threshold) / 10000 + tier2_rate_bp × max(sales − threshold, 0) / 10000, 2)`.
+- Rate-config is a single-row table; updates copy the previous values into
+  `inviter_commission_rate_config_history` in the same transaction. Reason is mandatory
+  on every change.
+- Rate changes take effect from the **next** billing cycle. The current month uses the
+  rate captured in `inviter_commission_batch.rate_config_snapshot` at batch start.
 
 ### Suspension
-- Suspension is immediate — `status = SUSPENDED` freezes all commission accrual
-- Suspended promoter's barcode → `status = REVOKED` (cannot be scanned)
-- Pharmacies under suspended promoter remain active but are flagged for Admin reassignment review
-- Reinstatement requires Admin action with logged reason
+
+- When a user is suspended in `mall-userms`, the same transaction sets
+  `ucenter_inviter_code.status = 'REVOKED'`. Subsequent registrations using the code
+  are rejected.
+- Suspension freezes commission accrual for that user. Pre-existing bindings stay.
+
+### Code partition inside `mall-rebate`
+
+- All HPMS code lives under `com.yuanfeng.rebate.inviter.*`. No shared classes,
+  controllers, services, or mappers with the existing rebate module. Tables use the
+  `inviter_commission_*` prefix; no joins or FKs to `rebate_*` tables.
+
+### Audit trail
+
+- Audit goes to **Kibana** via structured Logback log lines for every admin action,
+  rate change, suspension, batch run.
+- The **one DB exception** is `inviter_commission_rate_config_history`, because PRD §5.5
+  explicitly requires the admin rate-config page to display historical changes.
 
 ---
 
-## Database — 9 Entities
+## Stack and conventions
 
-```
-promoters               ← all 3 levels in one table, differentiated by `level` enum
-barcodes                ← one per promoter; sub-barcodes carry parent_barcode_id + root_barcode_id
-pharmacies              ← onboarding_barcode_id immutable; duplicate detection on reg
-orders                  ← only SETTLED contribute to commission
-commission_records      ← one per (promoter, pharmacy, billing_month); created by batch only
-onboarding_bonuses      ← one per pharmacy, ever; unique(pharmacy_id)
-audit_logs              ← APPEND ONLY; no UPDATE/DELETE permitted; 12-month retention minimum
-verification_call_logs  ← multiple per pharmacy; tracks Admin verification calls
-order_settlement_events ← full state-transition timeline per order
-```
+Everything inherited from `mall-parent`:
 
-### Key Indexes to Always Include
-- All FK columns
-- `pharmacies.territory`, `pharmacies.verification_status`, `pharmacies.onboarding_barcode_id`
-- `orders.billing_month`, `orders.order_status`, `orders.settled_at`
-- `commission_records(promoter_id, pharmacy_id, billing_month)` — composite unique
-- `promoters.status`, `promoters.level`, `promoters.parent_id`
-- `barcodes.root_barcode_id` — used for fast Field Lead attribution queries
+- Java 21 LTS, Spring Boot 3.2.4, Undertow, MyBatis-Plus 3.5.5, MySQL 8
+- `utf8mb4` / `utf8mb4_unicode_ci`. Storage timezone UTC; display Africa/Lagos at the
+  Spring/Jackson boundary.
+- Manual SQL DDL applied per module (house pattern); no Flyway for HPMS tables.
+- BIGINT auto-increment primary keys (matches surrounding modules; UUIDs were a
+  reverted v0.4 deviation).
+- `DECIMAL(15,2)` for money. Rates as `INT` basis points.
+- FastJSON 2.0.53 (house JSON library).
+- OpenFeign for sync inter-module calls. xxl-job (existing instance) for scheduled tasks.
+- Logback → Logstash TCP → Kibana for application logs.
 
 ---
 
-## API Groups (Reference)
+## Code conventions
 
-```
-POST   /auth/login
-POST   /users/champions          # Admin only
-POST   /users/agents             # Field Lead only
-POST   /users/ambassadors        # Field Agent only
-GET    /users/{id}/hierarchy
-
-POST   /barcodes/generate
-POST   /barcodes/sub
-POST   /barcodes/scan
-GET    /barcodes/{code}/owner
-
-POST   /pharmacies/register      # Triggered by scan
-PATCH  /pharmacies/{id}/verify   # Admin only
-GET    /pharmacies
-
-POST   /commissions/calculate    # Admin / cron
-GET    /commissions/{id}/summary
-GET    /commissions/{id}/breakdown
-GET    /commissions/report?month=YYYY-MM
-
-GET    /kpis/{id}?month=YYYY-MM
-GET    /kpis/leaderboard
-```
+- **Table naming:** `ucenter_inviter_*` in mall-userms; `inviter_commission_*` in mall-rebate.
+- **No DB triggers anywhere in HPMS.** Cross-row and immutability rules live in service code.
+- **No format CHECK constraints.** Format validation in service-layer validators.
+- **No FKs across the userms↔rebate boundary.** Use service calls (Feign) for cross-module reads.
+- **Idempotency keys** on every Feign write that may be retried (e.g. payment credit:
+  `batch_id + ":" + record_id`).
 
 ---
 
-## QA Scenarios (All Must Pass Before Release)
+## Open questions
 
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | Frontline Rep attempts recruit | 403 — rejected |
-| 2 | Duplicate pharmacy registration | Blocked — flagged for Admin |
-| 3 | Field Lead direct sale ₦1.5M | ₦20,000 → 100% Field Lead |
-| 4 | Field Agent pharmacy ₦1.5M | ₦18,000 Agent / ₦2,000 Lead |
-| 5 | Frontline Rep pharmacy ₦1.5M | ₦18,000 Rep / ₦2,000 Agent / ₦0 Lead |
-| 6 | Bonus triggered before first settled order | NOT paid |
-| 7 | Bonus triggered twice for same pharmacy | Second trigger rejected |
-| 8 | Suspended promoter pharmacy generates sales | Commission accrual frozen |
-| 9 | Agent sub-barcode scan | Correct Field Lead credited override |
-| 10 | Offline scan → reconnect | Registration synced; timestamp = scan time |
+These need product / Finance / Ops answers before some paths can be finalised. See
+[docs/02_PROJECT_CONTEXT.md §7](./docs/02_PROJECT_CONTEXT.md#7-open-product-questions-still-outstanding)
+and [docs/06_SCHEMA_DESIGN.md §8](./docs/06_SCHEMA_DESIGN.md#8-open-questions-for-finance--pm--ops).
 
----
+Don't hard-code answers to these in code without flagging:
 
-## Commission Calculation — Test Cases
-
-**₦1.5M pharmacy monthly sales:**
-- Gross = (1% × ₦1,000,000) + (2% × ₦500,000) = ₦10,000 + ₦10,000 = **₦20,000**
-
-**₦800K pharmacy monthly sales:**
-- Gross = 1% × ₦800,000 = **₦8,000**
+1. Default commission rates at launch (1% / 2% / ₦1M threshold) — Finance.
+2. Mid-month suspension semantics for orders settling on the suspension day — PM.
+3. Rounding mode (banker's vs half-up) — Finance.
+4. Whether code revocation can be decoupled from user suspension — PM.
+5. Soft-tag governance — who can grant `FIELD_PROMOTER` — Ops.
 
 ---
 
-## Out of Scope (v1.0)
+## Documentation map
 
-- Payment disbursement / bank API (commission records only — no actual payout)
-- Multi-currency
-- Gamification / leaderboard rewards
-- ERP / accounting integration
-- Pharmacy inventory or catalogue
-- 4th hierarchy level (hard product decision — not a future feature)
+When you change something, the doc to update is usually obvious. Quick reference:
 
----
-
-## Open Questions (Do Not Assume — Flag These)
-
-1. Pharmacy verification: manual call only, document upload, or both?
-2. Commission payout method: bank transfer, wallet, or third-party?
-3. Payout schedule: end of month, within 5 days?
-4. Field Lead removed mid-month: how are in-flight commissions handled?
-5. Reinstatement process for suspended promoters?
-
----
-
-## Agent Usage Guide
-
-- **Schema work** → invoke `database-reviewer` agent after generating SQL
-- **API design** → use `api-design` skill; enforce role checks at JWT level for every endpoint
-- **Migrations** → use `database-migrations` skill; each schema change = one migration file
-- **Security** → `/security-scan` before any PR to main; JWT role claims must be validated server-side
-- **Planning** → `/plan` before starting any new module; reference QA scenarios above as acceptance criteria
-
-## Code Conventions
-
-- All UUIDs stored as `CHAR(36)` — no auto-increment primary keys
-- All timestamps in UTC
-- Enum values must exactly match Data Dictionary (FIELD_LEAD not field_lead, etc.)
-- Audit log: never generate UPDATE or DELETE statements against `audit_logs` table
-- Commission batch: always idempotent — re-running for same billing_month must not create duplicates
+| What changed | Where to update |
+|---|---|
+| Schema (DDL) | [docs/06_SCHEMA_DESIGN.md](./docs/06_SCHEMA_DESIGN.md) |
+| A business rule moved between layers | [docs/07_APPLICATION_INVARIANTS.md](./docs/07_APPLICATION_INVARIANTS.md) |
+| Implementation diverges from PM docs | Add `D-NNN` entry in [docs/08_DEVIATIONS.md](./docs/08_DEVIATIONS.md) |
+| Cross-module integration shape | [docs/01_ARCHITECTURE.md](./docs/01_ARCHITECTURE.md) |
+| Timeline / decisions / open questions | [docs/02_PROJECT_CONTEXT.md](./docs/02_PROJECT_CONTEXT.md) |
+| Adding a new design doc | Next number after 08; update [docs/00_README.md](./docs/00_README.md) |

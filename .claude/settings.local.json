@@ -6,7 +6,11 @@
       "Bash(pip install *)",
       "Bash(python -c \"import docx; print\\('ok', docx.__version__\\)\")",
       "Bash(python database/build_schema_doc.py)",
-      "Bash(grep -n \"FL\\\\\\\\\\\\\\\\|AG\" c:/Users/HP/Videos/programming/hpms/docs/06_SCHEMA_DESIGN.md)"
+      "Bash(grep -n \"FL\\\\\\\\\\\\\\\\|AG\" c:/Users/HP/Videos/programming/hpms/docs/06_SCHEMA_DESIGN.md)",
+      "Bash(awk 'NR==146 || NR==147 || NR==148 || NR==173 || NR==174 || NR==175' c:/Users/HP/Videos/programming/hpms/docs/01_ARCHITECTURE.md)",
+      "Bash(grep -n '^```' c:/Users/HP/Videos/programming/hpms/docs/01_ARCHITECTURE.md)",
+      "Bash(awk 'NR==137 || NR==271' c:/Users/HP/Videos/programming/hpms/docs/07_APPLICATION_INVARIANTS.md)",
+      "Bash(awk 'NR>=100 && NR<=112' c:/Users/HP/Videos/programming/hpms/docs/02_PROJECT_CONTEXT.md)"
     ]
   }
 }

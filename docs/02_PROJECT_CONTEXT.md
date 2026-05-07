@@ -1,406 +1,316 @@
 # MSC HPMS — Project Context & Handoff
 
-**Purpose:** Complete context for continuing HPMS backend development in Claude Code. Hand this to your next assistant alongside the PRD, process diagrams, and data dictionary.
+**Purpose:** Complete context for continuing HPMS backend development in Claude Code.
+Hand this to your next assistant alongside the new PRD, the architecture, the schema
+design, the application invariants, and the deviations log.
 
-**Status:** Sprint 1 in progress. Architecture doc v0.4 sent to CTO. Repos to be created. DB schema in progress (you started this in Claude Code).
+**Status (6 May 2026):** PRD rewritten to v3.0 on 30 April. Team-lead resync on 4 May
+shifted the architecture from a standalone HPMS service to additions inside three
+existing `mall-parent` modules. Architecture, schema design, invariants, and deviations
+docs all rewritten 4–6 May. **Implementation has not started.** Repo skeleton is
+unnecessary now since HPMS lives inside `mall-parent`.
 
 ---
 
 ## 1. Project at a Glance
 
-**What HPMS is.** A Spring Boot service that automates MSC's tiered offline promotion network for pharmacies in Nigeria. Greenfield, not migrating from legacy. Three clients: Admin web portal, Promoter mobile app, Pharmacy mobile app.
+**What HPMS is.** An Inviter/Invitee referral platform inside the existing MSC platform.
+Every registered pharmacy user is automatically an Inviter, generates a unique invitation
+code + QR, and earns single-level commission on settled orders of any pharmacy they
+directly invite. No multi-level cascade, no role hierarchy in the system. In-house field
+promoters operate as standard Inviters with a soft tag (`user_flag = 'FIELD_PROMOTER'`)
+for operational reporting only — salary and HR managed offline.
 
-**Core domain.**
-- **3-level promoter hierarchy:** Field Lead → Field Agent → Frontline Rep. Hard cap, no exceptions.
-- **Barcode-based pharmacy onboarding:** promoters display QR, pharmacies scan, registration is attributed to the scanning promoter immutably.
-- **Multi-level commission engine:** monthly commission with override splits up the hierarchy; one-time onboarding bonus per pharmacy.
-- **Audit-everything posture:** every commission event, status change, admin action logged immutably.
+**Greenfield code, not greenfield infrastructure.** Distributed across `mall-userms`,
+`mall-rebate`, `mall-payment`, `mall-order` (read-only), and `mall-job`. No new service.
 
-**Key product decision.** HPMS records and calculates commissions. **Actual payouts happen in the existing MSC main app** — HPMS publishes commission-finalized events; main app credits wallets / processes payouts.
+**Authoritative product spec:** [MSC_HPMS_PRD_v3.0.md](./MSC_HPMS_PRD_v3.0.md). Earlier
+PDFs (PRD v2.0, Process Diagrams, Data Dictionary) are retained for historical context
+only — many of the entities they describe (3-tier promoters, barcodes-as-tree, onboarding
+bonus) are no longer part of the system.
 
 ---
 
-## 2. Timeline (immovable)
+## 2. Timeline
 
 | Date | Milestone |
 |---|---|
-| 21 Apr 2026 (Mon) | Sprint 1 kickoff — DONE |
-| 23 Apr 2026 (Wed) | Repo skeleton deployed to dev — TARGET |
-| 24 Apr 2026 (Fri) | OpenAPI contract frozen — TARGET |
-| 1 May 2026 (Fri) | Sprint 1 review — all APIs ready for UI build |
-| 4 May 2026 (Mon) | Sprint 2 kickoff |
-| 15 May 2026 (Fri) | MVP demo to GM, Fang Junjie, Abdulwahab — UAT sign-off |
-| 20 May 2026 (Wed) | Production go-live |
+| 21 Apr 2026 (Mon) | Sprint 1 kickoff — DONE (under previous PRD) |
+| 23 Apr 2026 (Wed) | (was: repo skeleton) — superseded |
+| 24 Apr 2026 (Fri) | (was: OpenAPI freeze) — superseded |
+| **30 Apr 2026 (Wed)** | **PRD v3.0 dropped — fundamental rewrite of the model** |
+| **4 May 2026 (Mon)** | **Team-lead resync — distributed-module architecture confirmed** |
+| 4–6 May 2026 | Architecture, schema, invariants, deviations docs rewritten |
+| TBD | MVP demo — being reassessed (PRD v3.0 §10 Q1) |
+| TBD | Production go-live — being reassessed |
 
-**~25 working days from kickoff to demo. ~30 to launch.**
+Working estimate for the rewrite phase ([01_ARCHITECTURE §9](./01_ARCHITECTURE.md#9-delivery-plan)):
+
+- Phase 1 — `mall-userms` additions: ~3–5 days
+- Phase 2 — `mall-rebate` additions: ~5–7 days
+- Phase 3 — `mall-payment` integration: ~1–2 days
+- Phase 4 — `mall-job` batch wiring: ~1 day
+- Phase 5 — frontend integration, QA, UAT: ~5–7 days
+
+These are coding-only estimates and exclude PRD-blocked items (rate defaults,
+suspension semantics, rounding mode).
 
 ---
 
 ## 3. Team
 
-- **Jubril** — Backend lead (you). Primary engineer. May get one optional second backend engineer.
-- **CTO** (Baraka Aluja) — Tech lead. Reviews architecture and schema. Communicates in Chinese; messages to him in English are fine, sometimes Chinese is appropriate.
-- **Bruce** — Senior stakeholder, currently on leave. CTO will sync with him on architecture decisions when he returns.
-- **PMs** — Authored PRD/process diagrams/data dictionary. Own open product questions.
-- **Frontend lead** — Owns Admin web + mobile app codebase(s). Will mock against OpenAPI starting 24 April.
-- **QA lead** — Will start hitting dev by Tuesday EOD each week.
+- **Job Kumdan** — Backend lead. Primary engineer.
+- **Team lead** (Baraka Aluja) — Reviews architecture and schema. Communicates in
+  Chinese sometimes; English messages fine. Approved the distributed-module shift on
+  4 May 2026.
+- **PMs** — Authored PRD v3.0. Own remaining open questions.
+- **Frontend lead** — Owns Admin web + mobile app codebases.
+- **QA lead** — Picks up dev builds weekly.
+- A few teammates handle other `mall-parent` modules; no one "owns" a single module —
+  HPMS additions to `mall-userms`, `mall-rebate`, `mall-payment` are coordinated
+  internally as needed.
 
 ---
 
-## 4. Stack — Final Decisions
+## 4. Stack
 
-```
+All inherited from `mall-parent`. No new infrastructure.
+
+```text
 Java 21 LTS + Spring Boot 3.2.4 + Undertow
-MyBatis-Plus 3.5.5 + Flyway 10.x + MySQL 8.x (utf8mb4_unicode_ci, tz Africa/Lagos)
+MyBatis-Plus 3.5.5 + manual SQL DDL + MySQL 8 (utf8mb4_unicode_ci)
 Redis + Jedis 5.2.0
-Nacos (config + service registration)
-JWT HS256 (jjwt) + Spring Security + BCrypt
-RocketMQ (cross-service integration with main app)
-xxl-job (scheduled tasks — see existing mall-job for pattern)
-Logback + logstash-logback-encoder 7.4
-Knife4j 4.4.0 (API docs at /doc.html)
+Nacos (config + discovery)
+JWT HS256 + Spring Security + BCrypt
+RocketMQ (existing topics; HPMS doesn't introduce new ones)
+xxl-job (existing instance, mall-job module)
+Logback + logstash-logback-encoder → Kibana
+Knife4j 4.4.0 (API docs)
 Hutool 5.8.29
-Jackson (NOT FastJSON)
-MinIO (in-house, for CSV exports)
-Bucket4j (rate limiting — NOT Sentinel)
-Multi-stage Dockerfile, eclipse-temurin:21-jre-alpine
+FastJSON 2.0.53
+OpenFeign + Spring Cloud LoadBalancer
 ```
 
-**Explicitly NOT used:**
-- Seata (no distributed transactions; single MySQL)
-- Feign (replaced by RocketMQ events for main-app integration)
-- Spring Cloud Gateway (not needed)
-- mall-commons dependency (patterns adapted, not depended on)
-- Sentinel (Bucket4j instead)
-- Spring Batch (xxl-job instead)
-- SkyWalking (deferred to post-MVP)
+The v0.4 deviation list (Flyway, Jackson, multi-stage Dockerfile, refresh tokens,
+mall-commons replacement, Bucket4j, etc.) is **fully reverted** along with the
+standalone-service decision. House conventions all the way.
 
 ---
 
-## 5. Module Boundaries — CRITICAL
+## 5. Module Distribution — CRITICAL
 
-The CTO explicitly asked for the codebase to be partitioned so that **scheduled tasks, admin functionality, and promoter functionality** can be cleanly extracted as independent services in the future. This is a hard requirement, not a nice-to-have.
+HPMS is implemented across three existing modules. **No new microservice.** No top-level
+HPMS package. Code-level partition keeps the option open to extract later if scale demands.
 
-```
-com.msc.hpms
-├── admin/              ← future Admin service
-│   ├── api/            ← /api/v1/admin/... controllers
-│   ├── pharmacy/       ← admin operations: verify, reject
-│   ├── promoter/       ← admin operations: suspend, reinstate
-│   └── reporting/
-│
-├── promoter/           ← future Promoter service
-│   ├── api/            ← /api/v1/promoter/... controllers
-│   ├── auth/
-│   ├── barcode/
-│   ├── pharmacy/       ← promoter view of their pharmacies
-│   ├── earnings/
-│   └── hierarchy/
-│
-├── jobs/               ← future Scheduled Tasks service
-│   ├── commission/     ← monthly commission batch (xxl-job handler)
-│   ├── bonus/          ← bonus eligibility scanner
-│   └── audit/          ← audit log housekeeping
-│
-├── integration/        ← integration with MSC main app
-│   ├── mainapp/        ← outbound HTTP / RocketMQ event consumers + producers
-│   └── webhook/
-│
-└── core/               ← shared domain (the "library" for the boundary modules)
-    ├── pharmacy/
-    ├── promoter/       ← PromoterDomainService (suspend, reinstate, etc.)
-    ├── barcode/
-    ├── order/          ← read-mirror of main-app order data
-    ├── commission/     ← commission calculation engine
-    ├── bonus/
-    ├── audit/
-    └── common/         ← envelope, exceptions, utilities, AOP annotations
-```
-
-**Cross-module rules (enforce in code review, write in CONTRIBUTING.md):**
-
-1. `admin/`, `promoter/`, `jobs/` MUST NOT import from each other directly.
-2. `admin/`, `promoter/`, `jobs/` MAY only depend on `core/` services.
-3. `core/` modules expose **public services** and **DTOs**. Entities and mappers stay internal.
-4. Database access is owned per-module. No mapper from one module accesses tables owned by another.
-5. Cross-module communication uses Spring `@EventListener` for HPMS-internal events.
-6. Integration with the main app uses RocketMQ events through `integration/mainapp/`.
-
-**Database ownership (logical, in one MySQL instance):**
-
-| Tables | Owner module |
-|---|---|
-| `promoters`, `promoter_hierarchy_audit` | `core/promoter` |
-| `barcodes` | `core/barcode` |
-| `pharmacies`, `verification_call_logs` | `core/pharmacy` |
-| `orders`, `order_settlement_events` | `core/order` (read-only, mirrored from main app) |
-| `commission_records`, `commission_batches` | `core/commission` |
-| `onboarding_bonuses` | `core/bonus` |
-| `audit_logs` | `core/audit` |
-
----
-
-## 6. Main-App Integration — Open Design
-
-This is the new requirement. **HPMS must integrate with the existing MSC main app**, because:
-
-- Pharmacy orders likely originate in the main app, not HPMS.
-- Pharmacy payments/settlement (Paystack) are handled by the main app.
-- Promoter commission payouts go through wallets/payout flows owned by the main app.
-- Identity may overlap between systems.
-
-### Integration touchpoints (to be finalized with the main-app team)
-
-**Inbound to HPMS (consumed):**
-- `OrderSettledEvent` — order settled, contains pharmacy_id, order_value, settled_at, settlement_ref. Drives commission eligibility.
-- `OrderRefundedEvent` — for future, claw-back logic post-MVP.
-- (Optional) `PharmacyKycUpdatedEvent` — if KYC lives in main app.
-
-**Outbound from HPMS (published):**
-- `CommissionBatchApprovedEvent` — fired when admin approves a monthly batch. Contains line items: `(promoter_id, billing_month, net_commission)`. Main app consumes this to credit promoter wallets.
-- `OnboardingBonusReadyEvent` — fired when bonus trigger conditions met. Main app credits the bonus.
-- `PromoterStatusChangedEvent` — suspended/reinstated. Main app may use this to freeze wallet activity.
-
-**Synchronous HTTP (to be decided per call):**
-- `GET /mainapp/users/{id}` — resolve promoter↔user identity, if HPMS doesn't own users.
-- Possibly: pharmacy enrichment data, payment method status.
-
-### Identity question (to be resolved)
-
-Two patterns possible:
-
-**Pattern A: HPMS owns its own users table.** HPMS issues its own JWTs. Promoter records map to main-app users via an integration field (`mainapp_user_id`).
-
-**Pattern B: HPMS uses main-app identity.** Main app issues JWTs; HPMS treats main-app user ID as the foreign key into its `promoters` table. HPMS doesn't have its own users table.
-
-Pattern B is cleaner for integration but requires the main app to support HPMS scopes/audience in its JWTs. Pattern A is more autonomous but requires sync logic. **Decision pending — needs discussion with main-app team.**
-
-### Commission lifecycle with integration
-
-```
-1. Pharmacy places order in main app
-2. Main app processes payment via Paystack
-3. Main app publishes OrderSettledEvent → RocketMQ
-4. HPMS integration/mainapp consumer receives event
-5. HPMS persists order_settlement_events row (read-mirror)
-6. HPMS jobs/commission monthly batch (xxl-job) processes settled orders
-7. HPMS creates commission_records (status=CALCULATED)
-8. Admin reviews + approves → status=APPROVED
-9. HPMS publishes CommissionBatchApprovedEvent → RocketMQ
-10. Main app consumes, credits promoter wallet, processes payout
-11. (Optional) Main app publishes CommissionPaidEvent
-12. HPMS marks commission_records as status=PAID
-```
-
----
-
-## 7. Domain Rules — Hard Requirements
-
-### Hierarchy
-- 3 levels max. Hard cap. Field Lead → Field Agent → Frontline Rep.
-- Field Leads created by Admin only.
-- Field Agents recruited by Field Leads only.
-- Frontline Reps recruited by Field Agents only.
-- Frontline Reps CANNOT recruit. Enforce at API level (not just UI).
-
-### Commissions
-
-**Onboarding bonus** (₦2,000 one-time per pharmacy, paid only when verified + first order settled):
-
-| Onboarded by | Direct recipient | Override recipient |
+| Module | What HPMS adds | Tables |
 |---|---|---|
-| Field Lead | Field Lead 100% (₦2,000) | — |
-| Field Agent | Field Agent 90% (₦1,800) | Field Lead 10% (₦200) |
-| Frontline Rep | Frontline Rep 90% (₦1,800) | Field Agent 10% (₦200) |
+| `mall-userms` | Invitation codes, Inviter↔Invitee bindings, soft `user_flag`, user-facing invite endpoints, admin user-flag endpoints | `ucenter_inviter_code`, `ucenter_inviter_binding`, new column `ucenter_user_base.user_flag` |
+| `mall-rebate` | Rate config + history, commission records, batch run records, admin endpoints. New package `com.yuanfeng.rebate.inviter.*` — **no shared classes with existing rebate code** | `inviter_commission_rate_config`, `inviter_commission_rate_config_history`, `inviter_commission_batch`, `inviter_commission_record` |
+| `mall-payment` | New income type `Sales Commission`; internal Feign endpoint to credit balances | (no schema changes) |
 
-⚠️ **Field Lead receives 0% on Frontline Rep-onboarded pharmacies.** Confirm this with PMs before implementation.
+Two more modules participate without owning HPMS code:
 
-**Monthly commission** (calculated on settled orders only, per pharmacy per month):
-- 1% on first ₦1,000,000 of monthly pharmacy sales
-- 2% on amount above ₦1,000,000
+- `mall-order` — source of settled-order data; `mall-rebate` reads via Feign
+- `mall-job` — hosts the monthly commission xxl-job handler; mirrors `RebateDistributionJob`
 
-| Scenario | Field Lead | Field Agent | Frontline Rep |
-|---|---|---|---|
-| Field Lead direct sale | 100% | — | — |
-| Field Agent-onboarded pharmacy | 10% override | 90% | — |
-| Frontline Rep-onboarded pharmacy | 0% | 10% override | 90% |
+See [01_ARCHITECTURE](./01_ARCHITECTURE.md) for the cross-module data flows.
 
-### Pharmacy onboarding
-- Barcode must be scanned before registration accepted. No manual override.
-- Online only — offline scan is OUT OF MVP scope (confirmed at kickoff).
-- Duplicate detection (canonical, per data dictionary):
-  - **Hard:** `business_registration_number` (CAC number) — block immediately
-  - **Soft:** `pharmacy_name + street_address + lga` exact match — block, flag for admin
-- Ownership timestamp set server-side at scan time. Immutable.
+---
+
+## 6. Domain Rules — Hard Requirements (PRD v3.0)
+
+### Inviter / Invitee model
+
+- Every registered user automatically qualifies as an Inviter — no separate application,
+  no Admin approval.
+- Lifetime binding: each user is bound to at most one Inviter, ever. Subsequent codes
+  are silently ignored.
+- Single-level commission: the direct Inviter earns from each settled order placed by
+  their direct Invitee. **No cascading.** A→B→C: B earns on C's orders, A earns nothing
+  from C.
+- No depth limit on the chain.
+
+### Commission
+
+- Triggered by an Invitee's order reaching SETTLED status (consumed in arrears by the
+  monthly batch).
+- Rate (default, configurable by Admin):
+  - 1% on monthly settled Invitee orders up to ₦1,000,000
+  - 2% on amounts above ₦1,000,000 per Invitee per month
+- Calculated per pharmacy per month, then aggregated per Inviter.
+- Settled commission is credited to the Inviter's MSC account balance (in `mall-payment`)
+  with income type `Sales Commission`.
+- No commission generated for non-SETTLED orders.
 
 ### Suspension
-- Admin can suspend any promoter; suspension freezes commission accrual immediately.
-- Suspended promoter's barcode → REVOKED, cannot be scanned.
-- Pharmacies under suspended promoter remain active but flagged for admin reassignment review.
+
+- Admin can suspend any user. Suspension freezes commission accrual immediately.
+- Suspended user's invitation code is revoked — new registrations using it are rejected.
+- Pre-existing bindings remain (suspension does not retroactively unbind invitees).
+
+### Field promoters
+
+- Operate as standard Inviters in the system — no commission-logic distinction.
+- `user_flag = 'FIELD_PROMOTER'` is set by an admin endpoint for reporting/filtering only.
+- Salary and HR managed offline by MSC HR.
 
 ---
 
-## 8. Open Product Questions — Need Closure by 23 April
+## 7. Open Product Questions (still outstanding)
 
-These four questions are blocking design completeness. Send to PMs as a spec delta memo:
+| # | Question | Status | Owner |
+|---|---|---|---|
+| 1 | Default commission rates at launch — confirm 1%/2%/₦1M threshold | Open | GM / Finance |
+| 2 | Commission payout method — wallet only, or bank transfer too? | Open | Finance |
+| 3 | What constitutes pharmacy certification (KYC) — document upload, manual review, or both? | Open | MSC Ops |
+| 4 | How many field promoters at launch and in which cities? | Open | GM / Operations |
+| 5 | Mid-month suspension semantics — exact rule for orders settling that day | Open | PM |
+| 6 | Rounding mode (banker's vs half-up) | Open | Finance |
+| 7 | Decoupling code revocation from user suspension — separate use case? | Open | PM |
+| 8 | Soft-tag governance — who can grant `FIELD_PROMOTER`? | Open | Ops |
+| 9 | Revised MVP delivery deadline | In progress | PO + team |
 
-1. **Field Lead 0% on Frontline Rep-onboarded pharmacies** — confirmed? Or should Field Lead get a small override (e.g., 5%, with Rep dropping to 85%)?
-2. **Suspension mid-month** — what happens to in-flight commissions for the suspended promoter? Do downstream promoters' commissions still flow if their upstream is suspended? Do upstream overrides still flow if downstream is suspended?
-3. **Pharmacy verification workflow** — does MVP require call-log workflow (per Process Diagram 8), or is a simple admin "verify" toggle sufficient? Recommendation: simple toggle for MVP, full workflow post-MVP.
-4. **Cross-region** — is cross-region Field Lead approval in MVP, or deferred?
-
----
-
-## 9. Spec Inconsistencies (already identified, fix in code/comments)
-
-- **PRD vs Process Diagram vs Data Dictionary** disagree on duplicate detection criteria. **Use the Data Dictionary version**: hard on `business_registration_number`, soft on `pharmacy_name + street_address + lga`.
-- **API paths in PRD §6** still say `/users/champions`, `/users/agents`, `/users/ambassadors` — these are old terminology. Use `/api/v1/admin/field-leads`, `/api/v1/field-leads/agents`, etc.
-- **Data dictionary barcode format** says `MSC-CH-...` but prototype shows `MSC-FL-...`. Use `MSC-FL-...` (FL = Field Lead, AG = Agent, FR = Frontline Rep) — match the renamed terminology.
-- **PRD §4.6 says barcode scanning works offline** — this was deprecated at kickoff. Online only.
-- **QA scenario #10 (offline scan)** — withdrawn.
+Many of these are blocking only the seed migration or specific tests; coding can begin
+on most paths in parallel.
 
 ---
 
-## 10. Definition of Done (per feature)
+## 8. Already-Resolved Things (capturing decisions)
 
-A feature is "done" only when ALL of:
-
-- [ ] Endpoint implemented and deployed to dev
-- [ ] OpenAPI spec updated and merged
-- [ ] Unit tests passing
-- [ ] Integration tests passing against real MySQL via Testcontainers
-- [ ] Error responses conform to the agreed error envelope with documented 2xxxx codes
-- [ ] Audit log entries written wherever the data dictionary requires them
-- [ ] RBAC enforced at controller level AND re-checked in service layer
-- [ ] QA has hit the endpoint on dev and signed off
-- [ ] Code reviewed and merged to develop
-
-"Demoable" is NOT "done."
-
----
-
-## 11. API Conventions
-
-- Base path: `/api/v1/`
-- Audience prefix: `/api/v1/admin/...` and `/api/v1/promoter/...`
-- Response envelope:
-
-```json
-{
-  "code": 1,
-  "message": "Operation successful",
-  "data": { },
-  "traceId": "uuid-here"
-}
-```
-
-`code: 1` = success, `code: 0` = failure. (House convention. Don't use HTTP status alone.)
-
-- Pagination envelope: `{ totalCount, pageSize, totalPage, currPage, list }`
-- DateTime: `"yyyy-MM-dd HH:mm:ss"`, timezone Africa/Lagos
-- Error code ranges (5-digit ints):
-
-```
-20xxx = HPMS-generic       21xxx = promoter / hierarchy
-22xxx = barcode            23xxx = pharmacy
-24xxx = order              25xxx = commission / bonus
-26xxx = audit              27xxx = verification
-28xxx = main-app integration
-```
+- **Service vs module:** module (distributed across mall-userms / mall-rebate / mall-payment).
+  Team lead, 4 May 2026.
+- **Field promoter management:** option B — soft tag (`user_flag` column). Team lead, 4 May 2026.
+- **Pharmacy data ownership:** stays in mall-userms; HPMS does not own a `pharmacies`
+  table. Implicit in distributed-module decision.
+- **Commission engine reuses rebate module:** new tables and code, NO shared classes
+  with existing rebate. Team lead, 4 May 2026.
+- **Wallet credit mechanism:** Feign call from `mall-rebate` to `mall-payment` on admin
+  approval; payment writes to existing balance with new income type code.
+- **Order trigger:** Feign + monthly batch (no real-time per-order trigger). Verified
+  against existing `RebateServiceClient` pattern in `mall-order`.
+- **Audit:** Kibana for everything; one DB exception for `inviter_commission_rate_config_history`
+  because PRD §5.5 requires a history view.
+- **Storage timezone:** UTC at the connection, Africa/Lagos at the Spring/Jackson boundary.
+- **PKs:** `BIGINT AUTO_INCREMENT` (matches surrounding modules; UUID deviation reverted).
+- **Money:** `DECIMAL(15,2)`. **Rates:** stored as basis points (`INT`).
 
 ---
 
-## 12. Anti-Patterns to Avoid (from existing codebase audit)
+## 9. What's Next (in order)
 
-The existing MSC codebase has known issues. Do NOT replicate:
+1. **Send team lead the seed-config defaults question** (Q1 above) so we can finalize
+   the launch values for `inviter_commission_rate_config`.
+2. **Apply the DDL** in dev environment — the seven CREATE/ALTER statements from
+   [06_SCHEMA_DESIGN](./06_SCHEMA_DESIGN.md) §2–§3.
+3. **Phase 1 implementation in `mall-userms`:**
+   - `InviterCodeGenerator` + `InviterCodeService`
+   - Registration flow extension (accept optional `invitation_code`)
+   - `InviterBindingService` with the silent-ignore on UNIQUE violation
+   - User suspension hook → revoke code
+   - Admin endpoints for `user_flag`
+   - Feign endpoints consumed by `mall-rebate` (lookup binding for invitee)
+4. **Phase 2 implementation in `mall-rebate`:**
+   - New package `com.yuanfeng.rebate.inviter.*`
+   - Rate-config CRUD + history-with-reason
+   - `InviterCommissionBatchService` with idempotent upsert
+   - Admin endpoints (rate config, batch trigger, commission report, approve)
+   - User-facing endpoints (my-summary, my-breakdown)
+   - Feign clients to `mall-userms` and `mall-order`
+5. **Phase 3 — `mall-payment`:** internal Feign endpoint `credit-commission` with
+   idempotency key on `(batch_id, record_id)`.
+6. **Phase 4 — `mall-job`:** xxl-job handler `InviterCommissionBatchJob`, scheduled
+   monthly, callable on demand from xxl-job admin console.
+7. **Frontend integration** — admin pages (rate config, history, commission report),
+   user pages (my QR, my invitees, my commission).
+8. **QA, UAT, launch.**
 
-- ❌ Hardcoded JWT secret `"sangeng"` in source — use env-injected 256-bit random
+---
+
+## 10. API Conventions
+
+Follow each module's existing convention. No HPMS-wide path prefix. Examples:
+
+- `mall-userms` — `POST /users/register`, `GET /invitations/my-code`,
+  `PATCH /admin/users/{id}/flag`
+- `mall-rebate` — `GET /inviter-commission/my-summary`,
+  `PUT /admin/inviter-commission/rate-config`,
+  `POST /admin/inviter-commission/run-batch`
+- `mall-payment` — `POST /internal/payment/credit-commission` (Feign-only)
+
+Response envelope: `{code, message, data, traceId}` per house. Pagination:
+`{totalCount, pageSize, totalPage, currPage, list}`. DateTime in JSON: `yyyy-MM-dd HH:mm:ss`.
+
+---
+
+## 11. Anti-Patterns Already Flagged
+
+From the existing codebase audit (still applicable):
+
+- ❌ Hardcoded JWT secret in source — use env-injected
 - ❌ Plaintext credentials in Nacos `bootstrap.yml` — use `${ENV_VAR}` substitution
-- ❌ `Executors.newSingleThreadExecutor()` per call — use a shared `@Bean ThreadPoolTaskExecutor`
-- ❌ Duplicate error code 10002 — keep error codes unique
-- ❌ Package typo `annnotation` (3 n's) — spell `annotation` correctly
-- ❌ Class typo `BizCodeEnume` — spell `BizCodeEnum` correctly
+- ❌ `Executors.newSingleThreadExecutor()` per call — use shared `@Bean ThreadPoolTaskExecutor`
 - ❌ `allowedOriginPatterns("*")` in CORS — restrict per environment
-- ❌ Single 60-min JWT with no refresh — use access + refresh
-- ❌ Manual SQL migrations — use Flyway
-- ❌ FastJSON — use Jackson
+
+These are existing-codebase issues; HPMS code added to those modules should not replicate them.
 
 ---
 
-## 13. Existing Codebase Patterns to Borrow (don't depend on, just learn from)
+## 12. Working Agreements
 
-The existing MSC services have good patterns worth learning:
-
-- **`ResponseResult<T>` envelope** with `code`/`message`/`data` shape — adopt the shape, write your own implementation
-- **`PageUtils` pagination wrapper** — adopt the shape (`totalCount, pageSize, totalPage, currPage, list`), write your own
-- **`GlobalExceptionHandler`** mapping domain exceptions to envelope responses — adopt the pattern, write your own
-- **AOP annotations**: `@SysLog`, `@RoleRequired`, `@RepeatClick` — adopt the pattern, write your own (without the bugs)
-- **Logback profile-based appenders**: console for local, Logstash TCP for dev/test/prod — copy the structure
-- **Nacos bootstrap.yml** with extension configs (`base.yaml`, `mybatis.yaml`, `redis.yaml`) — copy the structure
-- **xxl-job pattern** from `mall-job` — reference for HPMS scheduled tasks
-- **JwtAuthenticationTokenFilter** — copy the structure, write your own with the secret externalized
-- **Dockerfile pattern** with Africa/Lagos timezone and JAVA_OPTS — copy and make multi-stage
-
----
-
-## 14. Working Agreements (signed at kickoff)
-
-- **API contract:** OpenAPI published by 24 April; breaking changes need 24h written notice.
-- **Environments:** dev = `develop` branch always deployed; staging = `release/*`; prod = tagged releases. No direct DB modifications.
-- **PRs:** under 400 lines reviewed in 4 hours; 400-800 in 1 day; over 800 split. CI must be green.
+- **Spec changes:** commission math, rate-config behaviour, lifetime-binding semantics
+  require written PM + team-lead sign-off before implementation.
+- **PRs:** under 400 lines reviewed in 4 hours; 400–800 in 1 day; over 800 split.
 - **QA:** stable dev build by Tuesday EOD weekly. Bugs need traceId.
-- **Spec changes:** commission math, hierarchy rules, bonus logic require written PM+CTO sign-off before implementation.
 
 ---
 
-## 15. Risks Worth Tracking
+## 13. Risks Worth Tracking
 
-1. **Main-app integration scope and contract** — highest risk. Slippage cascades to commission delivery.
-2. **Commission correctness under edge cases** — needs the four open PMquestions answered.
-3. **Frontend-backend contract drift** — mitigated by 24 April freeze.
-4. **Single-engineer backend capacity** — push for second engineer confirmation this week.
-5. **PM open questions not closed by Wednesday** — escalate if needed.
-
----
-
-## 16. What's Already Done
-
-- [x] PRD, process diagrams, data dictionary read and reconciled
-- [x] Existing MSC codebase audited (see existing service for conventions)
-- [x] Architecture doc v0.4 sent to CTO
-- [x] CTO feedback received and incorporated:
-  - Nacos for service registration (in addition to config)
-  - xxl-job for scheduled tasks (not @Scheduled)
-  - Module boundaries (admin/promoter/jobs) for future service extraction
-  - Schema review when ready
-- [x] Sprint 1 kickoff DoD agreed
-- [x] Offline scan dropped from MVP
+1. **PM open questions blocking finalisation** — especially Q1 (rate defaults), Q5
+   (mid-month suspension), Q6 (rounding). Code can proceed on assumptions but tests can't
+   freeze without answers.
+2. **Cross-module Feign chain depth** — batch goes mall-job → mall-rebate →
+   mall-userms + mall-order. Failures of any leg need clean retries; the
+   `inviter_commission_batch.status` is the recovery anchor.
+3. **Tier-formula correctness across rate-change boundaries** — partially mitigated by
+   `rate_config_snapshot` JSON, but admin UX needs to make the "next billing cycle"
+   semantics clear.
+4. **Idempotent payment credit** — the deterministic key `batch_id + ":" + record_id`
+   needs to be honoured by `mall-payment`. Coordinate with whoever builds that endpoint.
+5. **Single-engineer capacity** still applies as before.
 
 ---
 
-## 17. What's Next (in order)
+## 14. What's Already Done
 
-1. **DB schema** — finish `V1__init.sql`. Send to CTO for review when ready.
-2. **Spec delta memo to PMs** — close the 4 open questions by Wednesday.
-3. **Repo skeleton** — Spring Boot app with module structure, Flyway migration, Nacos config, JWT filter, response envelope, exception handler, Knife4j, Docker, deployed to dev by Wednesday.
-4. **Main-app integration design** — meet with main-app team to agree on event contracts and identity pattern. Document in `INTEGRATION.md`.
-5. **OpenAPI contract** — frozen by Friday so frontend can mock.
-6. **Task breakdown** — derive tickets from OpenAPI endpoints + integration work.
-7. **Sprint 1 build:** auth, RBAC, hierarchy, barcode, pharmacy registration with duplicate detection.
-8. **Sprint 2 build:** commission engine, bonus trigger, admin verify/suspend, promoter app endpoints, main-app integration, frontend integration, QA.
-9. **UAT week:** bug fixes, performance benchmark, backup/restore drill.
-10. **Production launch 20 May.**
-
----
-
-## 18. Files in this Handoff
-
-- `01_ARCHITECTURE.md` — architecture doc v0.4 (the file that goes to CTO)
-- `02_PROJECT_CONTEXT.md` — this file (the one for your next assistant)
-- `03_PRD_v2.0.pdf` — Product Requirements Document
-- `04_ProcessDiagrams_v1.0.pdf` — Business process flowcharts
-- `05_DataDictionary_v1.0.pdf` — Field-level entity definitions
+- [x] Original PRD, process diagrams, data dictionary read and reconciled (under v2.0 model)
+- [x] Existing `mall-parent` codebase audited for relevant integration points
+- [x] Original architecture doc (v0.4) sent to team lead and approved (under v2.0 model)
+- [x] First-pass schema written for v2.0 model (now archived; not used)
+- [x] **PRD v3.0 read and reconciled**
+- [x] **Team-lead resync on 4 May 2026 — distributed-module architecture confirmed**
+- [x] **Architecture v1.0 written**
+- [x] **Schema design v1.0 written**
+- [x] **Application invariants v1.0 written**
+- [x] **Deviations log v1.0 written**
+- [x] Standalone-service skeleton (`src/main/resources/db/migration/V1__init.sql`) removed
+- [x] Resync brief disposed (decisions folded into the main docs)
 
 ---
 
-*End of handoff. Good luck.*
+## 15. Files in this Handoff
+
+| File | Purpose |
+|---|---|
+| [00_README.md](./00_README.md) | Documentation index + maintenance guide |
+| [01_ARCHITECTURE.md](./01_ARCHITECTURE.md) | Distributed-module architecture v1.0 |
+| [02_PROJECT_CONTEXT.md](./02_PROJECT_CONTEXT.md) | This file |
+| [archive/](./archive/) | Superseded PM-authored PDFs (PRD v2.0, Process Diagrams, Data Dictionary) |
+| [06_SCHEMA_DESIGN.md](./06_SCHEMA_DESIGN.md) | Schema v1.0 (the seven new tables/columns across mall-userms and mall-rebate) |
+| [07_APPLICATION_INVARIANTS.md](./07_APPLICATION_INVARIANTS.md) | Service-layer business rules + tests |
+| [08_DEVIATIONS.md](./08_DEVIATIONS.md) | Numbered log of deliberate divergences from PM docs |
+| [MSC_HPMS_PRD_v3.0.md](./MSC_HPMS_PRD_v3.0.md) | **The authoritative product spec** |
+
+---
+
+*End of handoff. Updated 6 May 2026.*

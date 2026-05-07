@@ -1,449 +1,317 @@
-# HPMS — Application-Layer Invariants
+# HPMS — Application-Layer Invariants v1.0
 
-The database enforces **structural invariants only** (referential integrity, uniqueness,
-compliance-mandated immutability, basic type sanity). Every rule below is a **business
-invariant that lives in the application layer** — service code, validators, workflow
-handlers, or batch jobs.
+> Business rules enforced in service code, not at the database. This file is the
+> domain-layer checklist for review and testing.
 
-Companion docs: [06_SCHEMA_DESIGN.md](./06_SCHEMA_DESIGN.md) (design narrative)
-and [08_DEVIATIONS.md](./08_DEVIATIONS.md) (engineering choices vs PM docs).
+The database enforces structural invariants only — uniqueness, referential integrity,
+NOT NULL, basic type sanity. Every rule below is a **business invariant** owned by an
+application service.
+
+Companion docs: [06_SCHEMA_DESIGN](./06_SCHEMA_DESIGN.md) · [08_DEVIATIONS](./08_DEVIATIONS.md) · [01_ARCHITECTURE](./01_ARCHITECTURE.md).
 
 Each rule:
 
 - States the rule precisely.
-- Names the service/handler that owns enforcement.
+- Names the module and service that owns it.
 - Lists the tests that must cover it.
 
-**If you add a new business rule, add it here first. If you find a rule that has no test,
-that's a bug.** This file is the checklist for the domain layer.
+**If you add a new business rule, add it here first. If you find a rule that has no
+test, that's a bug.**
 
 ---
 
-## 1. Promoter Hierarchy
+## 1. Invitation codes (mall-userms)
 
-### I-001 · Parent level correctness
+### I-001 · Every registered user gets exactly one invitation code
 
-- **Rule:** `FIELD_AGENT.parent_id` must reference a promoter with `level = FIELD_LEAD`.
-  `FRONTLINE_REP.parent_id` must reference a promoter with `level = FIELD_AGENT`.
-- **Owner:** `RecruitmentService` — `POST /api/v1/field-leads/agents`,
-  `POST /api/v1/field-agents/reps`.
-- **Tests:** reject agent-with-rep-parent, reject rep-with-lead-parent, reject rep-with-rep-parent.
+- **Rule:** On successful user registration, a row in `ucenter_inviter_code` is created
+  in the same transaction. The code is a generated short alphanumeric string that survives
+  uniqueness check on `ucenter_inviter_code.code`.
+- **Module:** `mall-userms`
+- **Owner:** `InviterCodeService.createForUser(userId)` — invoked from the user-registration flow.
+- **Tests:**
+  - register a fresh user → exactly one `ucenter_inviter_code` row exists with status `ACTIVE`
+  - simulate code-collision on first attempt → service retries until success
+  - registration transaction rolls back if code creation fails
 
-### I-002 · Frontline Reps cannot recruit
+### I-002 · Code generation collision retry
 
-- **Rule:** A `FRONTLINE_REP` attempting to create any child → hard 403. Logged to `audit_logs`
-  with `action_type=ACCOUNT_CREATED` and a denied-recruitment reason.
-- **Owner:** JWT role guard on recruitment endpoints (`@PreAuthorize` + service-layer re-check).
-- **Tests:** QA scenario #1 (CLAUDE.md).
+- **Rule:** Generator produces a code; if the unique-key insert fails, retry up to N times
+  (suggested N=5) before surfacing as a 5xx. Generation must be entropy-driven (not
+  monotonic) to keep codes unguessable.
+- **Module:** `mall-userms`
+- **Owner:** `InviterCodeGenerator`.
+- **Tests:** force two collisions then a success — exactly 3 generator calls, 1 stored row.
 
-### I-003 · parent_id and level are immutable
+### I-003 · Code revocation on user suspension
 
-- **Rule:** Once set at creation, `promoters.parent_id` and `promoters.level` cannot be changed.
-  Suspension and reinstatement change `status`, never hierarchy.
-- **Owner:** `PromoterUpdateService` — rejects any PATCH that touches these columns.
-- **Tests:** PATCH with `parent_id` or `level` must return 400.
-
-### I-004 · created_by polymorphism
-
-- **Rule:** For `level=FIELD_LEAD`, `created_by` must be a valid `admin_id`. For AGENT/REP,
-  `created_by` must be the recruiting promoter's `promoter_id`.
-- **Owner:** `RecruitmentService`.
-- **Tests:** unit tests over each recruit path.
-- **Note:** May change with main-app integration identity decision (Pattern A vs B). See D-001.
-
-### I-005 · Suspension requires reason
-
-- **Rule:** When `promoters.status` transitions to `SUSPENDED`, `suspension_reason` must be
-  provided (max 500 chars) and the action written to `audit_logs`.
-- **Owner:** `PromoterSuspensionService`.
-- **Tests:** suspend without reason → 400; suspend with reason → audit row exists.
-
-### I-006 · Email required for Field Leads
-
-- **Rule:** `email_address` is `NOT NULL` for `FIELD_LEAD`; optional for AGENT and REP.
-- **Owner:** Validator on `POST /api/v1/admin/field-leads`.
+- **Rule:** When `mall-userms` suspends a user, the same transaction sets
+  `ucenter_inviter_code.status = 'REVOKED'`. Validation endpoints reject `REVOKED` codes
+  with a clear "code invalid" response — never disclose the underlying suspension.
+- **Module:** `mall-userms`
+- **Owner:** `UserSuspensionService` (existing) + new hook into `InviterCodeService`.
+- **Tests:** suspend a user → their code rejects new registrations; existing bindings
+  remain.
 
 ---
 
-## 2. Barcodes
+## 2. Inviter ↔ Invitee binding (mall-userms)
 
-### I-010 · Barcode creation is coupled to promoter creation
+### I-010 · Binding is created on registration only
 
-- **Rule:** A promoter and their barcode are created in the same transaction. Neither
-  exists alone. `promoters.barcode_id` is populated before the transaction commits.
-- **Owner:** `PromoterCreationService` (single transactional method).
+- **Rule:** `ucenter_inviter_binding` is written exclusively by the registration flow,
+  in the same transaction as the user creation. No admin endpoint mutates bindings.
+- **Module:** `mall-userms`
+- **Owner:** `RegistrationService.register(...)`.
+- **Tests:** assert no other code path reaches `InviterBindingMapper.insert()`.
 
-### I-011 · root_barcode_id semantics
+### I-011 · Lifetime binding (UNIQUE-violation = silent ignore)
 
-- **Rule:** For a `FIELD_LEAD` barcode, `root_barcode_id = barcode_id` (self).
-  For `FIELD_AGENT` and `FRONTLINE_REP` barcodes, `root_barcode_id` points to the Field Lead
-  at the top of the chain — NOT the direct parent.
-- **Owner:** `BarcodeFactory`.
-- **Tests:** create a 3-level chain, assert root barcode is the same UUID on all three rows.
+- **Rule:** If a user has been bound previously, any new code submitted at registration
+  is silently ignored. The user proceeds normally; no error. Detection: `UNIQUE` violation
+  on `invitee_user_id` is caught and converted to a no-op (PRD §5.1).
+- **Module:** `mall-userms`
+- **Owner:** `RegistrationService.applyInvitationCode(...)`.
+- **Tests:**
+  - user A bound to B; user A submits a new code at re-registration → no error,
+    binding unchanged
+  - QA scenario #3 (PRD §8)
 
-### I-012 · parent_barcode_id alignment
+### I-012 · Self-invitation is rejected
 
-- **Rule:** `barcodes.parent_barcode_id` must be NULL iff the owner is a `FIELD_LEAD`, and
-  must reference the barcode of the owner's `promoters.parent_id` otherwise.
-- **Owner:** `BarcodeFactory`.
+- **Rule:** If the validated invitation code resolves to the same `user_id` as the
+  registering user, the binding is not created (this should be impossible in practice
+  since codes only exist after registration completes — but defensively reject).
+- **Module:** `mall-userms`
+- **Owner:** `RegistrationService.applyInvitationCode(...)`.
+- **Tests:** force the rare race; assert no row inserted.
 
-### I-013 · Barcode is immutable after creation
+### I-013 · No-cycle invariant is irrelevant by construction
 
-- **Rule:** `promoter_id`, `parent_barcode_id`, `root_barcode_id` never change.
-- **Owner:** `BarcodeUpdateService` — only `status` can be mutated.
+- **Note:** Because binding is set once at registration and never moves, a cycle is
+  structurally impossible (an Inviter must exist before they can be invited; their own
+  Inviter row was set when they registered earlier). No runtime check needed.
 
-### I-014 · Revoked barcodes cannot be scanned
+### I-014 · Binding is immutable after creation
 
-- **Rule:** `POST /api/v1/promoter/barcodes/scan` returns `410 Gone` if the barcode status
-  is `REVOKED`.
-- **Owner:** `ScanService`.
-
-### I-015 · Barcode code format
-
-- **Rule:** `barcode_code` follows `MSC-{LVL}-{6 digits}` where `LVL ∈ {FL, AG, FR}`
-  (Field Lead / Field Agent / Frontline Rep).
-- **Owner:** `BarcodeFactory` — generates with the correct prefix at creation.
-- **Note:** This corrects the older `CH/AG/AM` prefixes from earlier PRD drafts (see
-  [02_PROJECT_CONTEXT §9](./02_PROJECT_CONTEXT.md)).
-
----
-
-## 3. Pharmacy Onboarding
-
-### I-020 · Soft duplicate detection
-
-- **Rule:** Before INSERT, the registration service queries
-  `(pharmacy_name, street_address, lga)` for exact matches. Any match blocks the insert
-  and surfaces the candidate row(s) to Admin review queue.
-- **Owner:** `PharmacyRegistrationService`.
-- **Tests:** QA scenario #2.
-
-### I-021 · Registration timestamp is the scan time
-
-- **Rule:** `registration_timestamp` is the server-side timestamp captured at the moment
-  the scan request hits the API — immutable thereafter. Online only; offline scan is out of
-  scope for MVP (per Sprint 1 kickoff; QA scenario #10 withdrawn).
-- **Owner:** `ScanService`.
-
-### I-022 · Onboarding attribution is immutable
-
-- **Rule:** `onboarding_barcode_id`, `onboarding_promoter_id`, `registration_timestamp`
-  cannot be changed after INSERT. Admin reassignment of pharmacies (if/when implemented)
-  must create a new `pharmacy_assignments` entity, not mutate these fields.
-- **Owner:** `PharmacyUpdateService`.
-
-### I-023 · Verification requires verifier
-
-- **Rule:** When `verification_status` transitions to `VERIFIED` or `REJECTED`,
-  `verification_date` and `verified_by` must both be populated. `REJECTED` additionally
-  requires `rejection_reason`.
-- **Owner:** `PharmacyVerificationService` — `PATCH /api/v1/admin/pharmacies/{id}/verify`.
-- **Tests:** transition tests covering all valid and invalid status flips.
-
-### I-024 · `first_order_settled_at` is set by the integration consumer, not a user
-
-- **Rule:** Populated automatically when the `OrderSettledEvent` for a pharmacy's first
-  SETTLED order is consumed from the main app's RocketMQ topic. No API allows a user to
-  set this directly.
-- **Owner:** `OrderSettlementEventConsumer`.
-
-### I-025 · `onboarding_bonus_paid` is monotonic
-
-- **Rule:** Once set to `1`, this flag cannot revert to `0`. Updates that would do so
-  must raise a domain exception.
-- **Owner:** `BonusPaymentService`.
-- **Tests:** attempt to set 1 → 0 must throw.
+- **Rule:** No service updates `ucenter_inviter_binding` rows. Admin-driven reassignment
+  is not in scope for MVP.
+- **Module:** `mall-userms`
+- **Tests:** static analysis — no `update` SQL or MyBatis-Plus update call against
+  `InviterBindingMapper`.
 
 ---
 
-## 4. Orders & Settlement
+## 3. Field-promoter soft tag (mall-userms)
 
-### I-030 · Only SETTLED orders are commission-eligible
+### I-020 · Tag does not affect commission logic
 
-- **Rule:** The commission batch filters to `order_status = 'SETTLED'` with a non-null
-  `settlement_ref`, `settled_at`, and `billing_month`. Orders in any other status are
-  excluded.
-- **Owner:** `CommissionBatchJob`.
-- **Tests:** seed mixed-status orders, assert only SETTLED is counted.
+- **Rule:** The `user_flag` column is read by reporting and admin-filter endpoints only.
+  No commission calculation, batch logic, or Inviter eligibility checks branch on it.
+- **Module:** `mall-userms` (column owner), `mall-rebate` (reads via Feign for filtered reports).
+- **Tests:** snapshot test of the batch service: same input with `user_flag=NULL` and
+  `user_flag='FIELD_PROMOTER'` produces identical commission rows.
 
-### I-031 · `orders` is a read-mirror — no write endpoints
+### I-021 · Only admins can set the tag
 
-- **Rule:** No HPMS API accepts order creation or modification. All rows in `orders` and
-  `order_settlement_events` are written by the integration consumer projecting events from
-  the main app. Direct INSERT/UPDATE from any other code path is a bug.
-- **Owner:** `OrderSettlementEventConsumer`.
-- **Note:** Architecture decision per [01_ARCHITECTURE §4.8](./01_ARCHITECTURE.md).
-
-### I-032 · billing_month is derived, not user-input
-
-- **Rule:** `billing_month = format(settled_at, "yyyy-MM")` in UTC (storage TZ).
-  Computed by the settlement consumer, never accepted as input.
-- **Owner:** `OrderSettlementEventConsumer`.
-
-### I-033 · `commission_eligible` truth
-
-- **Rule:** An `order_settlement_events` row has `commission_eligible = 1` iff
-  `event_type = ORDER_SETTLED` AND the corresponding order has `order_value > 0`.
-- **Owner:** `OrderSettlementEventConsumer`.
-
-### I-034 · Idempotent event consumption
-
-- **Rule:** Each consumed RocketMQ event carries a unique key. The consumer rejects
-  duplicate keys without side effects. Used together with the `UNIQUE` on
-  `settlement_ref` to make the projection safe under retries.
-- **Owner:** `OrderSettlementEventConsumer`.
+- **Rule:** Tag set/unset endpoint requires admin role; service-layer re-check enforces
+  this even if the controller annotation is removed.
+- **Module:** `mall-userms`
+- **Owner:** `UserAdminService.setUserFlag(...)`.
 
 ---
 
-## 5. Commission Engine
+## 4. Commission rate config (mall-rebate)
 
-### I-040 · Rate tiers
+### I-030 · Single active config row
 
-- **Rule:** For a pharmacy's monthly sales total `S`:
-  - `gross = 0.01 × min(S, 1_000_000) + 0.02 × max(0, S - 1_000_000)`
-  - Result rounded to 2 decimal places. Rounding mode pending Finance decision (Q10).
-- **Owner:** `CommissionCalculator`.
-- **Tests:** ₦1.5M → ₦20,000; ₦800K → ₦8,000; ₦1M exact → ₦10,000; ₦0 → ₦0.
+- **Rule:** `inviter_commission_rate_config` has exactly one row. Service initialization
+  asserts `count = 1` and fails fast otherwise.
+- **Module:** `mall-rebate`
+- **Owner:** `InviterCommissionRateService.assertSingleRow()` — invoked at boot.
+- **Tests:** integration test with 0 rows fails boot; with 2 rows fails boot.
 
-### I-041 · Split matrix
+### I-031 · Update is transactional with history insert
 
-- **Rule:** Split depends on the LEVEL of the pharmacy's onboarding promoter:
+- **Rule:** Rate update is a single transaction:
+  1. INSERT `inviter_commission_rate_config_history` with the `prev_*` and `new_*` values plus the actor + reason.
+  2. UPDATE `inviter_commission_rate_config` with the new values.
+  3. Emit a structured Kibana log line.
+- **Module:** `mall-rebate`
+- **Owner:** `InviterCommissionRateService.update(actor, newRates, reason)`.
+- **Tests:** simulate failure between (1) and (2) — both roll back; live config and
+  history stay consistent.
 
-  | Onboarder level | Lead | Agent | Rep | commission_type per row |
-  |---|---|---|---|---|
-  | FIELD_LEAD      | 100% | —    | —   | DIRECT |
-  | FIELD_AGENT     | 10%  | 90%  | —   | OVERRIDE (Lead), DIRECT (Agent) |
-  | FRONTLINE_REP   | 0%   | 10%  | 90% | OVERRIDE (Agent), DIRECT (Rep). Lead row NOT created at 0%. |
+### I-032 · Reason is required on every change
 
-- **Owner:** `CommissionSplitter`.
-- **Tests:** QA scenarios #3, #4, #5.
-- **Pending confirmation** of Field Lead 0% on Rep-onboarded pharmacies (Q1 in 02_PROJECT_CONTEXT).
+- **Rule:** `reason` is non-blank; whitespace-only fails validation. Enforced both at
+  controller (Bean Validation) and service.
+- **Module:** `mall-rebate`
+- **Tests:** empty reason → 400; reason of `"   "` → 400.
 
-### I-042 · commission_type ↔ split_percentage coherence
+### I-033 · Rate change is effective from the next billing cycle
 
-- **Rule:** `DIRECT` rows have `split_percentage = 100`. `OVERRIDE` rows have 90 or 10.
-  The calculator produces only valid combinations; reject any other combination in test.
-- **Owner:** `CommissionSplitter`.
+- **Rule:** A rate change committed mid-month does not affect the current month's batch.
+  The batch reads the rate row and snapshots it into `inviter_commission_batch.rate_config_snapshot`
+  at start.
+- **Module:** `mall-rebate`
+- **Owner:** `InviterCommissionBatchService`.
+- **Tests:** batch begins; rate change committed concurrently; batch's resulting rows use
+  the snapshot, not the new value.
 
-### I-043 · net_commission formula
+### I-034 · Only admins can update rates
 
-- **Rule:** `net_commission = round(gross_commission × split_percentage / 100, 2)`.
-  Computed and written by the batch — not a database-generated column (see D-004).
-- **Owner:** `CommissionCalculator`.
-- **Tests:** assert every inserted `net_commission` equals the formula.
+- **Rule:** Admin role required; service-layer re-check.
+- **Module:** `mall-rebate`
+- **Tests:** QA scenario #7 (PRD §8) — non-admin returns 403.
 
-### I-044 · Idempotent batch re-run
+---
 
-- **Rule:** Re-running the batch for the same `billing_month` is a no-op for unchanged
-  inputs. Implementation uses `INSERT ... ON DUPLICATE KEY UPDATE` against
-  `uq_commission_ppb`, updating `total_pharmacy_sales`, `gross_commission`,
-  `net_commission`, and `batch_id` only if the values changed.
-- **Owner:** `CommissionBatchJob` (xxl-job handler).
-- **Tests:** run batch twice, assert row count unchanged; run with new SETTLED orders, assert update.
+## 5. Commission engine (mall-rebate)
 
-### I-045 · Suspended promoters accrue no commission
+### I-040 · Single-level attribution
 
-- **Rule:** Before inserting a commission row, the batch checks
-  `promoters.status != SUSPENDED`. Suspended promoters are skipped entirely for that month.
-- **Owner:** `CommissionBatchJob`.
-- **Tests:** QA scenario #8.
-- **Open:** mid-month suspension semantics for upstream OVERRIDE rows — see Q11.
+- **Rule:** Commission is computed only for the direct Inviter of the user who placed
+  the settled order. The batch never walks up the binding chain.
+- **Module:** `mall-rebate`
+- **Owner:** `InviterCommissionBatchService.runBatch(billingMonth)`.
+- **Tests:**
+  - A→B→C→D chain; D places a settled order; only the (C, D, month) commission row exists
+  - QA scenario #5 (PRD §8)
 
-### I-046 · Status workflow
+### I-041 · Tier formula
+
+- **Rule:** Per Invitee, per billing month, commission =
+  - `tier1_rate_bp × min(invitee_monthly_sales, tier1_threshold) / 10000`
+  - `+ tier2_rate_bp × max(invitee_monthly_sales − tier1_threshold, 0) / 10000`
+  - rounded to 2 decimal places (rounding mode pending Finance).
+- **Module:** `mall-rebate`
+- **Owner:** `CommissionCalculator.compute(invitee_monthly_sales, rateConfig)`.
+- **Tests:**
+  - ₦800,000 → ₦8,000 (entirely tier 1)
+  - ₦1,000,000 exact → ₦10,000
+  - ₦1,500,000 → ₦20,000 (₦10,000 + ₦10,000)
+  - ₦0 → ₦0
+  - banker's vs half-up rounding chosen and asserted in test fixtures
+
+### I-042 · Idempotent batch re-run
+
+- **Rule:** Running the batch twice for the same `billing_month` produces the same final
+  state. Implementation uses `INSERT ... ON DUPLICATE KEY UPDATE` against
+  `uq_inviter_record_iim`. Updated values: `invitee_monthly_sales`, `commission_amount`,
+  `batch_id`, `rate_config_id`. Status, approval, and paid timestamps are NOT overwritten
+  if the row is already past `CALCULATED`.
+- **Module:** `mall-rebate`
+- **Owner:** `InviterCommissionBatchService`.
+- **Tests:**
+  - run batch, capture state, run again with identical inputs → identical state
+  - new settled order added between runs → re-run picks it up
+  - already-`APPROVED` row → re-run does not flip back to `CALCULATED`
+
+### I-043 · Suspended Inviter accrues no commission
+
+- **Rule:** Before upserting a record, the batch checks the Inviter's `status` in
+  `mall-userms` (via Feign or via a join if same DB). If suspended, the row is skipped.
+- **Module:** `mall-rebate`
+- **Tests:** QA scenario #8 (PRD §8) — suspended inviter; settled invitee order produces
+  no record.
+- **Open:** Q2 (PRD §10) — exact mid-month semantics still pending PM confirmation.
+
+### I-044 · Status workflow
 
 - **Rule:** `CALCULATED → APPROVED → PAID` happy path. `CALCULATED → DISPUTED → APPROVED → PAID`
-  dispute path. `APPROVED` and `PAID` require `approved_by` and `approved_at`.
-  `DISPUTED` requires `dispute_note`.
-- **Owner:** `CommissionWorkflowService`.
+  dispute path. Reverse transitions are not allowed.
+- **Module:** `mall-rebate`
+- **Owner:** `InviterCommissionWorkflowService`.
 
-### I-047 · CommissionBatchApprovedEvent published on approval
+### I-045 · Approval triggers wallet credit
 
-- **Rule:** When an admin approves a batch (transitions all `CALCULATED` rows to `APPROVED`
-  for a billing_month), HPMS publishes `CommissionBatchApprovedEvent` to RocketMQ. The main
-  app consumes this and credits promoter wallets.
-- **Owner:** `CommissionWorkflowService` (publisher); main app (consumer).
-- **Tests:** integration test asserts event payload matches the line items.
+- **Rule:** When an admin approves a batch, all `CALCULATED` rows for that batch flip to
+  `APPROVED`. In the same transaction the service Feign-calls `mall-payment` to credit
+  the balance. On Feign failure the transaction rolls back. After payment confirms
+  (synchronous response), rows transition to `PAID`.
+- **Module:** `mall-rebate`
+- **Owner:** `InviterCommissionWorkflowService.approveBatch(...)`.
+- **Tests:** Feign failure → status stays `CALCULATED`; success → status advances to `PAID`.
 
-### I-048 · Batch run record
+### I-046 · Batch run is recorded explicitly
 
-- **Rule:** Every commission batch invocation creates a `commission_batches` row at start
-  (`status=RUNNING`), updates to `COMPLETED` or `FAILED` at end. The xxl-job log id is
-  written to `xxl_job_log_id` for cross-reference. Records produced by a run reference it
-  via `commission_records.batch_id`.
-- **Owner:** `CommissionBatchJob`.
+- **Rule:** Every batch invocation creates an `inviter_commission_batch` row at start
+  (`status = RUNNING`), captures the rate-config snapshot into
+  `rate_config_snapshot` JSON, and updates to `COMPLETED` or `FAILED` at end. The
+  xxl-job log id is written for cross-reference.
+- **Module:** `mall-rebate`
+- **Owner:** `InviterCommissionBatchService`.
 
----
+### I-047 · Idempotent payment credit
 
-## 6. Onboarding Bonus
-
-### I-050 · Trigger conditions
-
-- **Rule:** Bonus becomes `READY_TO_PAY` only when BOTH:
-  1. `verification_met_at` is populated (pharmacy verified).
-  2. `first_order_met_at` is populated (first SETTLED order observed via integration).
-- **Owner:** `BonusEligibilityEvaluator` (xxl-job — periodic scan).
-- **Tests:** QA scenario #6 (bonus before first settled order must not pay).
-
-### I-051 · Double-payment guard (app layer)
-
-- **Rule:** Second INSERT for the same `pharmacy_id` is impossible at the DB (UNIQUE), but
-  the service also handles the resulting error gracefully — on UNIQUE violation, return
-  the existing bonus row instead of 500.
-- **Owner:** `BonusCreationService`.
-- **Tests:** QA scenario #7.
-
-### I-052 · Split amounts
-
-- **Rule:**
-  - `FIELD_LEAD` direct onboarder: `recipient_1_amount = 2000`, `recipient_2_*` null.
-  - `FIELD_AGENT` or `FRONTLINE_REP` onboarder: `recipient_1_amount = 1800`,
-    `recipient_2_amount = 200`.
-  - `total_bonus_amount` always equals the sum of recipient amounts (2000).
-- **Owner:** `BonusSplitter`.
-- **Tests:** three seed promoters at each level, assert correct amounts.
-
-### I-053 · Supervisor linkage
-
-- **Rule:** `recipient_2_id` (when non-null) must equal the `promoters.parent_id` of
-  `recipient_1_id`. Validated at bonus creation.
-- **Owner:** `BonusSplitter`.
-
-### I-054 · Pharmacy flag sync
-
-- **Rule:** When a bonus row's `trigger_status` transitions to `PAID`, the same transaction
-  updates `pharmacies.onboarding_bonus_paid = 1`. Both writes must succeed or both roll back.
-- **Owner:** `BonusPaymentService.disburse()` — single transactional method.
-- **Tests:** assert DB state consistency after a paid bonus.
-
-### I-055 · Paid bonus is terminal
-
-- **Rule:** Once `trigger_status = PAID`, the row cannot be updated further. `paid_at`
-  must be set.
-- **Owner:** `BonusPaymentService`.
-
-### I-056 · OnboardingBonusReadyEvent published on `READY_TO_PAY`
-
-- **Rule:** When trigger_status transitions to `READY_TO_PAY`, HPMS publishes
-  `OnboardingBonusReadyEvent` to RocketMQ. The main app credits the bonus and (optionally)
-  publishes a paid-confirmation event back, prompting HPMS to flip to `PAID`.
-- **Owner:** `BonusPaymentService` (publisher).
+- **Rule:** The Feign call to `mall-payment` carries a deterministic idempotency key
+  (e.g. `batch_id + ":" + record_id`). Retries with the same key do not double-credit.
+- **Module:** `mall-rebate` (sender), `mall-payment` (receiver).
+- **Tests:** simulate retry; balance increments exactly once.
 
 ---
 
-## 7. Audit Logs
+## 6. Format validators (mall-userms)
 
-### I-060 · Required-reason action types
+Pure input validation; the database stores whatever the application inserts.
 
-- **Rule:** Writes with these `action_type` values must include `reason`:
-  `ACCOUNT_SUSPENDED`, `PHARMACY_REJECTED`, `DISPUTE_RAISED`, `DISPUTE_RESOLVED`.
-- **Owner:** `AuditLogger`.
+### I-080 · Invitation code format
 
-### I-061 · previous_state / new_state population
+- Generator output: 8 alphanumeric characters, uppercase + digits. Excludes confusable
+  chars (0/O, 1/I/l).
+- Validator on incoming registration: regex `^[A-HJ-NP-Z2-9]{8}$` (illustrative; final
+  charset to be confirmed when generator is implemented).
 
-- **Rule:** `previous_state` is null for creation events; `new_state` is null for deletion
-  events (there are no deletion events in v1 — soft-delete not modelled).
-- **Owner:** `AuditLogger`.
+### I-081 · billing_month format
 
-### I-062 · Actor polymorphism
+- Regex `^[0-9]{4}-(0[1-9]|1[0-2])$`. Validated on every write path that accepts a
+  billing month from outside.
 
-- **Rule:** When `actor_role = ADMIN`, `actor_id` refers to `admins`. Otherwise it refers
-  to `promoters`. `SYSTEM` uses a reserved UUID (Q9 — proposed
-  `00000000-0000-0000-0000-000000000000`).
-- **Owner:** `AuditLogger`.
+### I-082 · phone_number, business_reg_number, and other userms formats
 
-### I-063 · No UPDATE, no DELETE, ever
-
-- **Rule:** Any code path that would modify or delete an audit row is a bug. The DB
-  enforces this two ways (triggers + GRANT — see D-007), but the app must not even attempt
-  it. Attempts indicate a contract violation somewhere.
-- **Owner:** every writer.
+- Inherited from `mall-userms` existing validators. HPMS adds nothing new here.
 
 ---
 
-## 8. Verification Calls
+## 7. Open questions
 
-> Full call-log workflow may be deferred for MVP — Q3 in [02_PROJECT_CONTEXT](./02_PROJECT_CONTEXT.md).
-> If MVP ships with a simple verify toggle, invariants I-070..I-073 are inactive until
-> the call-log feature is enabled.
+Tracked here so they don't get lost in design conversation.
 
-### I-070 · follow_up_required auto-set
-
-- **Rule:** On outcomes `SUSPICIOUS` or `CALLBACK_REQUESTED`, the service sets
-  `follow_up_required = 1` automatically. Admin can also set it manually for any outcome.
-- **Owner:** `VerificationCallService`.
-
-### I-071 · follow_up_date required when follow_up_required = 1
-
-- **Rule:** App-level validator enforces this on INSERT.
-- **Owner:** `VerificationCallService`.
-
-### I-072 · follow_up_done cascade
-
-- **Rule:** When a new call log is created for a pharmacy, any previous calls with
-  `follow_up_required = 1 AND follow_up_done = 0` are updated to `follow_up_done = 1`.
-- **Owner:** `VerificationCallService`.
-
-### I-073 · call_date not in future
-
-- **Rule:** Reject any `call_date > today`.
-- **Owner:** validator.
+- **Q1** — Reserved `actor_admin_id` UUID for system-seeded rate config? Or do we leave
+  the column NULL on the seed row only? (Currently: NULL on the very first history row;
+  service enforces NOT NULL on subsequent rows.)
+- **Q2** — Rounding mode for commission: banker's vs half-up. Finance decision.
+- **Q3** — Mid-month suspension semantics for orders that settle on the suspension day.
+- **Q4** — Decoupling code revocation from user suspension (separate "deactivate code"
+  use case).
+- **Q5** — Soft-tag governance: who can grant `FIELD_PROMOTER`? Just super-admin or any
+  admin?
 
 ---
 
-## 9. Format Validators
+## What changed from the previous version
 
-These are pure input-validation rules; the DB stores whatever the app inserts.
+Previous v1.0 (29 April 2026) had ~50 invariants for a 3-tier hierarchy + barcodes +
+onboarding-bonus model. That entire model was replaced by the PRD rewrite.
 
-### I-080 · phone_number
+Removed (no longer applicable):
 
-- Nigerian format: `^\+234[0-9]{10}$`.
+- Hierarchy parent-level checks, recruit-permission rules, barcode chain alignment,
+  onboarding-bonus payment workflow, commission split matrix, OVERRIDE/DIRECT
+  type coherence, audit-log polymorphism rules, pharmacy-verification workflow,
+  pharmacy reassignment rules.
 
-### I-081 · business_reg_number (CAC)
+Added (new for the unified model):
 
-- Format: `^RC[0-9]{6,7}$`.
-
-### I-082 · nafdac_licence_number
-
-- Format: `^NAFDAC/PHARM/[A-Z0-9]+$`.
-
-### I-083 · bank_account_number
-
-- Exactly 10 digits, NUBAN checksum validated.
-
-### I-084 · legal_rep_id_number
-
-- Format depends on `legal_rep_id_type`:
-  - NIN: 11 digits
-  - BVN: 11 digits
-  - PASSPORT: 2 letters + 7 digits
-  - DRIVERS_LICENCE / VOTERS_CARD: per-issuer (document on implementation).
-
-### I-085 · billing_month
-
-- `^[0-9]{4}-(0[1-9]|1[0-2])$`.
+- Invitation-code lifecycle and revocation (I-001 … I-003)
+- Lifetime-binding silent-ignore semantics (I-010 … I-014)
+- Field-promoter soft-tag rules (I-020 … I-021)
+- Rate-config single-row + history-with-reason (I-030 … I-034)
+- Single-level attribution + tier formula (I-040 … I-041)
+- Idempotent batch + explicit batch run record (I-042 … I-046)
+- Idempotent payment credit (I-047)
 
 ---
 
-## Open Questions (need answers, not enforcement)
-
-- **Q9** — Reserved UUID for `audit_logs.actor_id` on `actor_role=SYSTEM` events.
-  Current proposal: `00000000-0000-0000-0000-000000000000`. Confirm with ops.
-- **Q10** — Rounding mode for commissions: banker's rounding vs half-up. Finance decision.
-- **Q11** — If a promoter is suspended mid-month, does their DIRECT pharmacy still generate
-  OVERRIDE commission for their upstream? PRD is silent.
-- **Q12** — Identity pattern (HPMS users vs main-app users) — affects ownership of
-  `created_by`, `verified_by`, `approved_by`. To be resolved in main-app integration design.
-
----
-
-## Change log
-
-- **2026-04-23** — Initial version. Moved from DB-layer CHECKs and triggers per
-  architectural review.
-- **2026-04-27** — Consolidation pass:
-  - Removed offline-sync language from I-021 (online-only per Sprint 1 kickoff).
-  - Updated API paths to `/api/v1/...` audience-segmented routes.
-  - Added I-015 (barcode FL/AG/FR prefix), I-031 (orders read-mirror), I-034 (idempotent
-    consumer), I-047 (CommissionBatchApprovedEvent), I-048 (batch run record),
-    I-056 (OnboardingBonusReadyEvent).
-  - Added Q12 (identity pattern decision pending).
+*End of document — Application Invariants v1.0 — 4 May 2026.*

@@ -1,379 +1,350 @@
-# MSC HPMS — Backend Architecture
+# MSC HPMS — Architecture v1.0
 
-**Technical Direction — v0.4 MVP**
+> Technical direction — distributed-module approach.
 
 | | |
 |---|---|
 | Project | MSC Hierarchical Promotion Management System (HPMS) |
-| Document version | 0.4 — Informational |
-| Author | Jubril (Backend Lead) |
-| Date | 21 April 2026 |
-| MVP launch | 20 May 2026 (demo 15 May) |
-| Repo | `hpms-backend` |
+| Document version | 1.0 — Distributed across existing mall-parent modules |
+| Author | Job Kumdan (Backend Lead) |
+| Date | 4 May 2026 |
+| Supersedes | v0.4 (21 April 2026) — standalone-service approach abandoned after PRD rewrite |
+| Approved by | Team lead (resync 4 May 2026) |
+| MVP launch | TBD — being reassessed after scope change |
 
-> **About this document.** This is an informational record of the technical direction for HPMS backend. Configuration patterns follow the existing service conventions. Stack choices are documented here for visibility — deviations from house convention are called out explicitly with their reasons. No approval is being requested; feedback and corrections are welcome.
-
----
-
-## 1. Overview
-
-HPMS is a Spring Boot service that automates MSC's tiered offline promotion network — barcode-based pharmacy onboarding, three-level promoter hierarchy, multi-level commission calculation, and audit. Three clients: Admin web, Promoter mobile app, Pharmacy mobile app.
-
-HPMS is built as a **modular monolith** that integrates with the existing MSC main application. Promoter payouts, order settlement, and certain identity concerns flow through the main app; HPMS owns the hierarchy, attribution, commission calculation, and audit logic. Module boundaries within HPMS are drawn so that scheduled tasks, admin functionality, and promoter functionality can be cleanly extracted as independent services in the future.
-
-MVP feature-complete demo: 15 May 2026. Production launch: 20 May 2026.
+> **About this version.** The previous architecture (v0.4, 21 April 2026) described HPMS
+> as a standalone Spring Boot service. Following the rewrite of the PRD on 30 April 2026
+> and the team-lead resync on 4 May 2026, **HPMS is no longer a standalone service.** It
+> is implemented as additions to three existing modules in `mall-parent`. This document
+> replaces v0.4 in full.
 
 ---
 
-## 2. Stack at a Glance
+## 1. What HPMS is
 
-| Layer | Choice | Version | Notes |
-|---|---|---|---|
-| Language | Java | 21 LTS | Matches house |
-| Framework | Spring Boot | 3.2.4 | Matches house |
-| Web server | Undertow | bundled | Matches house (Tomcat excluded) |
-| Data access | MyBatis-Plus | 3.5.5 | Matches house, XML mappers |
-| Database | MySQL | 8.x | utf8mb4_unicode_ci, tz Africa/Lagos |
-| Schema migrations | Flyway | 10.x | Deviation — house uses manual SQL |
-| Cache | Redis + Jedis | 5.2.0 | Matches house |
-| Config & discovery | Nacos | existing instance | Config + service registration |
-| Auth | JWT (jjwt) + Spring Security | HS256 | Matches house, + refresh tokens |
-| Password hashing | BCrypt | Spring bundled | Matches house |
-| Async | `@EventListener` / `@Async` + RocketMQ for cross-service | bundled / existing | Broker only for main-app integration |
-| Scheduled jobs | xxl-job | existing instance | Matches house — see `mall-job` |
-| Logging | Logback + logstash-logback-encoder | 7.4 | Matches house |
-| API docs | Knife4j | 4.4.0 | Matches house |
-| Utilities | Hutool | 5.8.29 | Matches house |
-| JSON | Jackson | Spring default | Deviation — house uses FastJSON |
-| Object storage | MinIO (in-house) | existing instance | For CSV exports |
-| Payment integration | via main app | — | HPMS does not handle payment directly |
-| Primary keys | UUID (BINARY(16)) | — | Deviation — house uses BIGINT |
-| Money | BigDecimal, DECIMAL(15,2) | — | Same as house intent |
-| Container base | eclipse-temurin:21-jre-alpine | — | Matches house |
+A self-service referral platform for pharmacy onboarding and growth. Every registered
+pharmacy user automatically becomes an Inviter, generates a unique invitation code and
+QR code, and earns single-level commission on the settled orders of any pharmacy they
+directly invite. There is no multi-level cascade and no role hierarchy. The authoritative
+product spec is [MSC_HPMS_PRD_v3.0.md](./MSC_HPMS_PRD_v3.0.md); the previous PDF is
+retained only for historical context.
+
+In-house field promoters operate as standard Inviters in the system. Their salary and
+HR are managed offline. A soft tag (`user_flag`) on the user record marks them for
+operational reporting only; commission logic does not branch.
 
 ---
 
-## 3. System Context
+## 2. Module distribution
 
-```
-                           ┌──────────────────┐
-                           │   Admin Portal   │
-                           │      (Web)       │
-                           └────────┬─────────┘
-                                    │
-     ┌──────────────────┐           │           ┌──────────────────┐
-     │   Promoter App   │───────────┼───────────│   Pharmacy App   │
-     │     (Mobile)     │           │           │     (Mobile)     │
-     └────────┬─────────┘           │           └────────┬─────────┘
-              │                     │                    │
-              └─────────── HTTPS ───┼────────────────────┘
-                                    ▼
-                           ┌──────────────────┐
-                           │  HPMS Backend    │
-                           │  (Spring Boot)   │
-                           └───┬──────┬───┬────┘
-                               │      │   │
-                               │      │   └─── Nacos / Logstash / xxl-job
-                               │      │
-                ┌──────────────┘      └──────────── MainApp (existing)
-                ▼                                   ├── Order/settlement events
-         ┌──────────────┐                           ├── Promoter wallet & payouts
-         │  MySQL 8     │                           ├── Identity / user records
-         │  Redis       │                           └── Paystack integration
-         │  MinIO       │
-         └──────────────┘
-```
+HPMS does not ship as its own service or Maven module. The functionality is implemented
+as new code and new tables inside three existing modules of `mall-parent`:
 
-HPMS is a single Spring Boot service. Three clients consume the same versioned REST API. The existing MSC main application owns payment processing (Paystack), promoter wallet/payout, and order settlement. HPMS owns hierarchy, attribution, commission calculation, and audit. Cross-system communication uses RocketMQ for events and HTTP for synchronous calls.
+| Module | What HPMS adds | New tables/columns |
+|---|---|---|
+| `mall-userms` | Invitation codes, Inviter↔Invitee bindings, field-promoter tag, user-facing invite endpoints | `ucenter_inviter_code`, `ucenter_inviter_binding`; new column `user_flag` on the existing user table |
+| `mall-rebate` | Inviter-commission rate config + history, commission records, batch run records, admin rate-config & report endpoints, batch handler called by `mall-job` | `inviter_commission_rate_config`, `inviter_commission_rate_config_history`, `inviter_commission_record`, `inviter_commission_batch` |
+| `mall-payment` | New income type `Sales Commission`; consumes commission-approval Feign call to credit the user balance | (no new tables — uses existing balance/income tables) |
 
----
+Two more existing modules participate without owning HPMS code:
 
-## 4. Decisions
-
-### 4.1 Architecture shape and module boundaries
-
-- Single Spring Boot service. One deployable JAR, one process.
-- **Modular monolith** structured for future service extraction. Three top-level boundaries are drawn now so they can become independent services later without surgical refactoring:
-  1. **Admin module** — admin portal endpoints and admin-specific use cases
-  2. **Promoter module** — promoter mobile app endpoints and promoter-specific use cases
-  3. **Jobs module** — scheduled tasks (commission batch, audit housekeeping)
-- A **Core module** holds shared domain logic and is consumed by the three boundary modules above.
-- Cross-module communication goes through public domain services only. No mapper-level access across modules.
-
-```
-com.msc.hpms
-├── admin/              ← future Admin service
-│   ├── api/            ← admin REST controllers (/api/v1/admin/...)
-│   ├── pharmacy/       ← admin operations: verify, reject
-│   ├── promoter/       ← admin operations: suspend, reinstate
-│   └── reporting/
-│
-├── promoter/           ← future Promoter service
-│   ├── api/            ← promoter REST controllers (/api/v1/promoter/...)
-│   ├── auth/
-│   ├── barcode/
-│   ├── pharmacy/       ← promoter view of their pharmacies
-│   ├── earnings/
-│   └── hierarchy/
-│
-├── jobs/               ← future Scheduled Tasks service
-│   ├── commission/     ← monthly commission batch
-│   ├── bonus/          ← bonus eligibility scanner
-│   └── audit/          ← audit log housekeeping
-│
-├── integration/        ← integration with MSC main app
-│   ├── mainapp/        ← outbound calls / event consumers
-│   └── paystack/       ← reserved (delegated to main app)
-│
-└── core/               ← shared domain
-    ├── pharmacy/
-    ├── promoter/       ← PromoterDomainService (suspend, reinstate, etc.)
-    ├── barcode/
-    ├── order/          ← read-only mirror of main-app order data
-    ├── commission/     ← commission calculation engine
-    ├── bonus/
-    ├── audit/
-    └── common/         ← envelope, exceptions, utilities, AOP annotations
-```
-
-**Cross-module rule:** any class in `admin/`, `promoter/`, or `jobs/` may only depend on `core/` services. `admin/` MUST NOT import from `promoter/` or vice versa. `core/` modules expose public services and DTOs; entities and mappers stay internal.
-
-**Database ownership** by core module (one MySQL, but each table has a logical owner):
-
-| Table | Owned by |
+| Module | Role |
 |---|---|
-| `promoters`, `promoter_hierarchy_audit` | `core/promoter` |
-| `barcodes` | `core/barcode` |
-| `pharmacies`, `verification_call_logs` | `core/pharmacy` |
-| `orders`, `order_settlement_events` | `core/order` (read-mirrored from main app) |
-| `commission_records`, `commission_batches` | `core/commission` |
-| `onboarding_bonuses` | `core/bonus` |
-| `audit_logs` | `core/audit` |
+| `mall-order` | Source of settled-order data. `mall-rebate`'s commission batch reads from it via Feign. No HPMS-specific code lives here. |
+| `mall-job` | Hosts the monthly commission batch as an xxl-job handler, mirrored on the existing `RebateDistributionJob` pattern. Calls `mall-rebate` via Feign. |
 
-### 4.2 Language, framework, server
+### Code-level partitioning
 
-- Java 21 LTS (matches house).
-- Spring Boot 3.2.4 (matches house).
-- Undertow as embedded server; Tomcat excluded (matches house).
-- Maven build, single-module for MVP; module split later if needed.
-- Packaged as runnable JAR.
+Within `mall-rebate`, all HPMS code lives under a dedicated package
+`com.yuanfeng.rebate.inviter.*` — controllers, services, mappers, entities, Feign clients.
+**No shared classes with the existing rebate code.** The `inviter_commission_*` tables are
+not joined to or referenced from the existing `rebate_*` tables. This is the team-lead's
+explicit instruction (resync, 4 May 2026): same module, same JAR, same DB, but logically
+separated so the two concerns can evolve independently and the package can be extracted
+to its own service later if scale demands.
 
-### 4.3 Data access and persistence
+The same partitioning applies in `mall-userms`: HPMS-specific code lives under
+`com.yuanfeng.userms.inviter.*`.
 
-- MyBatis-Plus 3.5.5 (matches house).
-- Entities follow house conventions: `@TableName(snake_case)`, `@Data` (Lombok), Serializable, field-level `@TableField` for camelCase↔snake_case mapping.
-- `BaseMapper<Entity>` for CRUD; custom methods declared on mapper interface and implemented in `src/main/resources/mapper/*.xml`.
-- Pagination returns `IPage<T>`, wrapped at controller layer in a `PageResult<T>` DTO.
-- **Deviation — primary keys:** UUIDs stored as `BINARY(16)`, serialized as string in JSON. House uses auto-increment BIGINT. HPMS uses UUIDs to match the PRD/data dictionary and to avoid enumeration attacks on IDs exposed in QR codes, mobile deep links, and public API responses. `BINARY(16)` keeps index size and join performance reasonable.
-- Money: `BigDecimal` in Java, `DECIMAL(15,2)` in MySQL, serialized as string in JSON to preserve precision.
-- Timestamps: `LocalDateTime` in Java, `DATETIME` in MySQL, timezone Africa/Lagos.
+### Why not a separate service
 
-### 4.4 Database
+Captured here so the reasoning isn't lost:
 
-- MySQL 8.x on the existing in-house MySQL instance (matches house).
-- Charset/collation `utf8mb4` / `utf8mb4_unicode_ci` (matches house).
-- Timezone Africa/Lagos.
-- **Deviation — migrations:** Flyway from day one. House uses manual SQL scripts; drift and rollback risk is unacceptable for a greenfield service with financial data. Migrations live in `src/main/resources/db/migration/` as `V{n}__{snake_case_name}.sql`. Spring's `ddl-auto` is set to `validate` in non-dev profiles.
+1. **Coupled with existing business by design.** The new PRD makes HPMS lean heavily on
+   existing user records, balances, and order events. A standalone service would have
+   been a thin shell around remote calls.
+2. **Rebate is the unified commission concept.** All commission-style logic in the
+   platform consolidates here. Different commission rules separate at the package level.
+3. **Infrastructure cost.** 17 microservices already run in production. Each addition
+   consumes cluster resources. When transaction volume warrants it, finer service
+   splitting can happen — package boundaries make extraction tractable.
 
-### 4.5 Configuration, discovery, and secrets
+---
 
-- Nacos for **dynamic configuration AND service registration** (matches house pattern).
-- Service registration enables unified service management/visibility and future interoperability with other MSC services.
-- Single service registered under the name `hpms` in MVP.
-- Extension configs follow the existing pattern: `base.yaml`, `mybatis.yaml`, `redis.yaml`. HPMS-specific extension: `hpms.yaml` for commission thresholds, performance tiers, feature flags.
-- Four environment profiles mirroring the house pattern: local, dev, test, prod.
-- **Deviation — secrets:** All credentials (database, Redis, JWT signing key, main-app integration tokens) injected via environment variables and referenced in Nacos configs as `${ENV_VAR}`. No plaintext passwords committed to repo or to Nacos.
+## 3. Stack inheritance
 
-### 4.6 Authentication and authorization
+Everything is inherited from `mall-parent`. No new infrastructure, no new dependencies,
+no new Nacos namespace, no new Docker image, no new CI pipeline.
 
-- JWT HS256 via JJWT library (matches house).
-- JWT signing key: 256-bit random, env-injected, rotatable.
-- **Deviation — refresh tokens:** Access token 15 minutes, refresh token 30 days (mobile) / 12 hours (admin web). House uses single 60-minute tokens. Refresh flow prevents mobile users from logging in every hour while keeping access tokens short-lived for revocation hygiene.
-- BCrypt password hashing (matches house).
-- Spring Security + method-level `@PreAuthorize`. Roles re-checked in service layer for defense in depth.
-- Custom `JwtAuthenticationTokenFilter`, patterned after the house implementation, re-implemented locally.
-- CORS configured per environment. Production restricts to known admin/mobile origins; no wildcard origins above local profile.
-- Rate limiting: Bucket4j-backed filter in front of sensitive endpoints (`/auth/login`, `/barcodes/scan`).
+| Layer | Stack |
+|---|---|
+| Language | Java 21 LTS |
+| Framework | Spring Boot 3.2.4 |
+| Web server | Undertow (Tomcat excluded) |
+| Data access | MyBatis-Plus 3.5.5, XML mappers |
+| Database | MySQL 8 (`utf8mb4_unicode_ci`, connection tz Africa/Lagos, UTC at storage layer) |
+| Schema migrations | Manual SQL (house convention) |
+| Cache | Redis + Jedis 5.2.0 |
+| Config & discovery | Nacos |
+| Auth | JWT HS256 via JJWT + Spring Security |
+| Async | RocketMQ 5.1.4 (existing topics only; HPMS does not introduce new ones) |
+| Sync inter-module | OpenFeign + Nacos discovery + Spring Cloud LoadBalancer |
+| Scheduled jobs | xxl-job (existing instance, `mall-job` module) |
+| Logging | Logback + logstash-logback-encoder → Kibana |
+| API docs | Knife4j 4.4.0 |
+| JSON | FastJSON 2.0.53 |
+| Money | `BigDecimal` in Java, `DECIMAL(15,2)` in MySQL |
 
-> **Identity integration with main app:** the relationship between HPMS promoter records and main-app user records is a boundary decision to be finalized during integration design. Two viable patterns: (a) HPMS owns its own users table and exchanges promoter↔main-app-user mappings via integration events, or (b) HPMS uses main-app-issued JWTs and treats main-app user IDs as foreign keys. To be resolved in integration design phase.
+The v0.4 architecture proposed several deviations from house convention (Flyway, Jackson,
+multi-stage Dockerfile, refresh-tokens, etc.). **All of those are now reverted.** HPMS
+inherits everything from the surrounding modules.
 
-### 4.7 API conventions
+---
 
-- REST over HTTPS. JSON request/response.
-- **Versioned base path:** `/api/v1/...` — deviation from house (which has no versioning prefix). Cheap insurance; zero cost to add now, painful to retrofit.
-- **Audience-segmented paths:** `/api/v1/admin/...` and `/api/v1/promoter/...` reflect the module boundaries from §4.1 and make future service extraction simpler.
-- Response envelope follows house shape:
+## 4. Cross-module data flows
 
-```json
-{
-  "code": 1,
-  "message": "...",
-  "data": { },
-  "traceId": "..."
-}
+### 4.1 Pharmacy registers with an invitation code
+
+```text
+Pharmacy app                    mall-userms
+    │
+    │  POST /users/register { invitation_code: "..." }
+    ├───────────────────────────────►
+    │
+    │     1. Validate code → ucenter_inviter_code lookup
+    │     2. Create user (existing flow)
+    │     3. If valid code AND user not previously bound:
+    │           INSERT ucenter_inviter_binding(invitee_user_id, inviter_user_id, …)
+    │     4. Generate THIS user's own invitation code:
+    │           INSERT ucenter_inviter_code(user_id, code, …)
+    │     5. Audit: structured log line → Kibana
+    │
+    │  ◄──── 200 OK with user profile + their own code
 ```
 
-- Pagination envelope follows house shape: `totalCount, pageSize, totalPage, currPage, list`.
-- Error codes: 5-digit integer scheme matching the house domain-grouping pattern. HPMS reserves the **20xxx** range to avoid collision with existing 11xxx–18xxx ranges.
+If the user is already bound (registered with a code previously), step 3 is skipped
+silently — PRD rule, never error to the user.
 
+### 4.2 Order settled → no real-time HPMS work
+
+`mall-order` settles an order normally; no HPMS Feign call is added to the settlement
+path. Commission is computed monthly because the rate tier (1% up to ₦1M, 2% above) needs
+the full per-Invitee monthly total to apply correctly. Doing it incrementally is harder
+and not required by the PRD.
+
+### 4.3 Monthly commission batch
+
+```text
+xxl-job (cron 0 0 2 1 * ?)
+    │
+    ▼
+mall-job: InviterCommissionBatchJob
+    │  Feign → mall-rebate /api/inviter-commission/run-batch?billingMonth=YYYY-MM
+    ▼
+mall-rebate: InviterCommissionBatchService
+    │
+    │  1. INSERT inviter_commission_batch(status=RUNNING, …)
+    │  2. Feign → mall-order: settled orders in [billingMonth start, end)
+    │  3. Feign → mall-userms: bindings for the invitee user_ids
+    │  4. Read current inviter_commission_rate_config
+    │  5. Aggregate per (inviter, invitee), apply tier formula, compute commission
+    │  6. UPSERT inviter_commission_record on (inviter_user_id, invitee_user_id, billing_month)
+    │     using INSERT ... ON DUPLICATE KEY UPDATE (idempotent re-runs)
+    │  7. UPDATE inviter_commission_batch(status=COMPLETED, totals, completed_at)
+    │  8. Audit: structured log line per batch → Kibana
+    │
+    │  ◄──── 200 OK
 ```
-20xxx = HPMS-generic    21xxx = promoter / hierarchy
-22xxx = barcode         23xxx = pharmacy
-24xxx = order           25xxx = commission / bonus
-26xxx = audit           27xxx = verification
-28xxx = main-app integration
+
+Re-runnable from xxl-job admin console with the same `billing_month` parameter — the
+composite unique key makes the upsert a no-op for unchanged data.
+
+### 4.4 Admin approves a commission batch → wallet credit
+
+```text
+Admin web                      mall-rebate                    mall-payment
+    │
+    │  PATCH /api/admin/inviter-commission/batches/{id}/approve
+    ├───────────────────────────►
+    │                              │
+    │                              │  UPDATE inviter_commission_record
+    │                              │     SET status=APPROVED, approved_by, approved_at
+    │                              │  WHERE batch_id = … AND status='CALCULATED'
+    │                              │
+    │                              │  Feign → mall-payment: creditCommissionBalance(line items)
+    │                              ├──────────────────────►
+    │                              │                          │
+    │                              │                          │  Credit balance per user
+    │                              │                          │  Insert income line:
+    │                              │                          │     income_type='Sales Commission'
+    │                              │                          │
+    │                              │  ◄────────────────────── 200 OK
+    │                              │
+    │                              │  UPDATE inviter_commission_record
+    │                              │     SET status=PAID, paid_at
+    │
+    │  ◄──── 200 OK with batch summary
 ```
 
-- DateTime JSON format `"yyyy-MM-dd HH:mm:ss"` with Africa/Lagos timezone — standardized consistently in both `@JsonFormat` and Docker.
-- OpenAPI docs: Knife4j 4.4.0 at `/doc.html`, v3 spec at `/v3/api-docs` (matches house).
-- **Deviation — JSON library:** Jackson (Spring default) instead of house FastJSON. FastJSON v1 had serious CVEs; Jackson is the Spring default and deeply integrated.
+### 4.5 Admin updates the commission rate
 
-### 4.8 Asynchronous work and main-app integration
-
-- **In-process events** via Spring `@EventListener` for HPMS-internal domain events (e.g., pharmacy verified → bonus eligibility check).
-- **Fire-and-forget work** via `@Async` backed by a shared `ThreadPoolTaskExecutor` bean (not per-call Executors).
-- **Cross-service messaging via RocketMQ** (matches house) for integration with the main app:
-  - HPMS consumes order settlement events published by the main app
-  - HPMS publishes commission-finalized events for the main app to action (wallet credit / payout queue)
-  - HPMS publishes promoter status change events (suspended, reinstated)
-- Idempotency keys on all consumed events; consumers safe to retry.
-- Topic and consumer group naming follows house conventions (mirror the `mall-*` patterns).
-
-### 4.9 Scheduled jobs
-
-- **xxl-job** for all scheduled tasks (matches house — see `mall-job` for the integration pattern). HPMS registers as an executor against the existing xxl-job admin console.
-- Commission batch: triggered monthly (cron `0 0 2 1 * ?`) via xxl-job and manually re-runnable through the xxl-job admin console.
-- Idempotent — re-runs upsert on composite key `(promoter_id, pharmacy_id, billing_month)`.
-- xxl-job execution history provides built-in audit trail and re-run capability.
-
-### 4.10 Logging and observability
-
-- SLF4J + Logback (matches house).
-- `logback-spring.xml` per-profile appender setup (matches house):
-  - local profile → `ConsoleAppender`, plain-text pattern
-  - dev/test/prod → `LogstashTcpSocketAppender`, JSON format, async delivery with queue 10240 and 80% discard threshold
-- Custom JSON fields: `APP_NAME=hpms`, `APP_ENV={profile}`, `SERVER_IP`, `traceId`.
-- Correlation ID filter sets `traceId` in MDC and in the API response envelope. TraceId is a UUID generated per request (SkyWalking integration deferred to post-MVP).
-- Actuator endpoints: `/actuator/health` public, `/actuator/prometheus` internal-only for future metrics scraping.
-
-### 4.11 Utilities and cross-cutting concerns
-
-- Hutool 5.8.29 for general utilities (matches house).
-- HPMS does NOT depend on `mall-commons`. Patterns (`ResponseResult` envelope, `PageResult` pagination, exception handler, custom annotations) are adapted and rewritten cleanly in the HPMS `core/common/` package.
-- Reason: greenfield service benefits from a clean dependency graph, zero external version drift, and freedom to evolve independently.
-- Custom AOP annotations adapted from the house pattern: `@SysLog` (method-level audit log emission), `@RateLimit` (Bucket4j-backed), `@RoleRequired` (complements `@PreAuthorize`).
-- Global exception handler in `core/common/exception/` maps domain exceptions to the `ResponseResult` envelope with the appropriate 2xxxx error code.
-
-### 4.12 Deployment
-
-- Dockerfile based on `eclipse-temurin:21-jre-alpine` (matches house).
-- Timezone Africa/Lagos set in the image (matches house).
-- **Deviation — multi-stage Dockerfile:** build stage + runtime stage, smaller and cleaner runtime image.
-- JVM tuning via `JAVA_OPTS` env var (matches house).
-- Environments: local, dev, test, prod (matches house).
-- Single repo, trunk-based with feature branches (deviation from house multi-repo submodule structure — monolith).
-- Migrations run automatically by Flyway on app startup (deviation from manual SQL).
+```text
+Admin web                      mall-rebate
+    │
+    │  PUT /api/admin/inviter-commission/rate-config
+    │      { tier1_threshold, tier1_rate, tier2_rate, reason }
+    ├───────────────────────────►
+    │
+    │   Single transaction:
+    │     1. INSERT inviter_commission_rate_config_history(
+    │            actor_id, prev_*, new_*, reason, effective_from, occurred_at)
+    │     2. UPDATE inviter_commission_rate_config SET … (single-row table)
+    │     3. Audit: structured log line → Kibana
+    │
+    │  Effective for next billing month (current month uses the rate
+    │  active when the batch runs).
+    │
+    │  ◄──── 200 OK
+```
 
 ---
 
-## 5. Data Model Summary
+## 5. API surface
 
-Nine entities, defined in the Data Dictionary v1.0 and implemented in `V1__init.sql`.
+All endpoints live inside the existing modules' controllers. No new gateway routes.
 
-- **promoters** — single table, `level` field differentiates Field Lead / Field Agent / Frontline Rep.
-- **barcodes** — one per promoter, with `parent_barcode_id` chain and `root_barcode_id` shortcut for attribution.
-- **pharmacies** — duplicate detection on `business_registration_number` (hard) and `pharmacy_name + street_address + lga` (soft).
-- **orders** — read-mirrored from main app via integration events. HPMS does NOT originate orders.
-- **order_settlement_events** — append-only log of order status transitions consumed from main app.
-- **commission_records** — one per promoter per pharmacy per billing month, composite unique key.
-- **onboarding_bonuses** — one per pharmacy ever, unique constraint prevents double-payment.
-- **audit_logs** — append-only, immutable, monthly partitioning from month 6 in production.
-- **verification_call_logs** — multiple per pharmacy, tracks admin verification calls.
+### 5.1 mall-userms (existing path conventions apply)
 
----
+User-facing:
 
-## 6. Non-Functional Concerns
+- `POST /users/register` — extended to accept optional `invitation_code`
+- `GET /invitations/my-code` — returns the authenticated user's invitation code + QR payload
+- `GET /invitations/validate?code={code}` — pre-registration validation
+- `GET /invitations/invitees` — list of users the authenticated user has invited
+- `GET /invitations/stats` — total invitees, cumulative commission (commission total fetched from rebate via Feign)
 
-**Performance.** Commission batch completes in under 10 minutes for 10,000 pharmacies (PRD §4.6). Core API p95 under 300 ms excluding the batch trigger. Benchmark against 1,000 pharmacies planned for end of Sprint 2.
+Admin:
 
-**Availability.** 99.5% core API uptime per PRD. Single-instance deployment in MVP. JWT statelessness and idempotent consumers leave the door open for horizontal scaling post-MVP.
+- `GET /admin/users?user_flag=FIELD_PROMOTER&...` — filter by soft tag
+- `PATCH /admin/users/{id}/flag` — set/unset `user_flag`
 
-**Security.** TLS at gateway. BCrypt password hashing. RBAC at controller and service layers. PII fields (phone, email, bank account) encrypted at rest. Rate limiting on sensitive endpoints. No secrets in repo or in Nacos plaintext.
+### 5.2 mall-rebate
 
-**Auditability.** Every commission event, status change, and admin action writes an `audit_log` entry with actor, timestamp, entity snapshot, and reason. Immutable by schema design and by database grant — the application DB user has INSERT-only on this table.
+Public (authenticated user):
 
-**Data protection.** Automated daily MySQL backups with 30-day retention. Point-in-time recovery via existing DB infrastructure. Restoration drill before go-live.
+- `GET /inviter-commission/my-summary?month=YYYY-MM`
+- `GET /inviter-commission/my-breakdown?month=YYYY-MM`
 
----
+Admin:
 
-## 7. Deviations from House Convention — Summary
+- `GET /admin/inviter-commission/rate-config`
+- `PUT /admin/inviter-commission/rate-config`
+- `GET /admin/inviter-commission/rate-config/history`
+- `POST /admin/inviter-commission/run-batch?billingMonth=YYYY-MM` (also called by mall-job)
+- `GET /admin/inviter-commission/report?month=YYYY-MM`
+- `GET /admin/inviter-commission/batches/{id}`
+- `PATCH /admin/inviter-commission/batches/{id}/approve`
 
-| Area | House pattern | HPMS pattern | Reason |
-|---|---|---|---|
-| Primary keys | Auto-increment BIGINT | UUID stored as BINARY(16) | PRD requirement; enumeration-attack resistance on public IDs |
-| Schema migrations | Manual SQL scripts | Flyway, auto-run on startup | Drift and rollback risk unacceptable for financial data |
-| JSON library | FastJSON 2.0.53 | Jackson | Spring default; FastJSON has CVE history |
-| Timestamps | `java.util.Date` | `LocalDateTime` | Modern, immutable, timezone-safer |
-| API versioning | No prefix | `/api/v1/` | Cheap insurance; painful to retrofit |
-| JWT tokens | Single 60-min token | Access 15 min + refresh 30d/12h | Mobile UX without relaxing access token hygiene |
-| JWT secret | Hardcoded in source | Env-injected 256-bit random | Security hardening |
-| `mall-commons` | Shared library dependency | Patterns adapted locally | Greenfield — clean dependency graph, no version drift |
-| Distributed tx | Seata | Local `@Transactional` + idempotent consumers | Single MySQL, no distributed transactions needed |
-| Rate limiting | Sentinel | Bucket4j filter | Avoid SCA dependency overhead |
-| Inter-service calls | Feign | RocketMQ events for main-app integration | Async, decoupled |
-| Repo structure | Multi-repo submodules | Single repo, feature branches | Monolith |
-| Dockerfile | Single-stage | Multi-stage | Smaller runtime image |
-| CORS | `allowedOriginPatterns("*")` | Per-env restricted origins | Security hardening |
-| Async executor | `newSingleThreadExecutor()` per call | Shared `ThreadPoolTaskExecutor` | Fixes thread leak |
+### 5.3 mall-payment
+
+Internal (Feign only, called by mall-rebate):
+
+- `POST /internal/payment/credit-commission` — credits commission line items, records `Sales Commission` income type
 
 ---
 
-## 8. Out of Scope for MVP
+## 6. Logging, audit, observability
 
-Confirmed by Sprint 1 kickoff and the Definition of Done.
+Inherited from house pattern: SLF4J → Logstash TCP → Kibana.
 
-- Offline barcode scanning and local sync.
-- Payment disbursement — handled by main app integration.
-- Multi-currency support.
-- KPI leaderboards, advanced dashboards, audit log live search UI.
-- Push notifications, WhatsApp/email QR sharing.
-- A fourth hierarchy level.
-- Horizontal scaling and multi-instance deployment.
-- APM / distributed tracing (SkyWalking) — deferred to post-MVP.
+Per team-lead direction, **HPMS does not maintain a separate `audit_logs` table.**
+Structured log lines via Kibana cover all admin actions, suspensions, and rate changes.
 
----
-
-## 9. Delivery Plan
-
-**Sprint 1 (21 April – 1 May): APIs and foundations**
-- Repo, CI pipeline, dev deployment running end-to-end by 23 April.
-- Auth, RBAC, promoter hierarchy CRUD, barcode generation, pharmacy registration with duplicate detection.
-- OpenAPI spec published and frozen by 24 April for frontend to mock against.
-- Main-app integration contracts drafted and shared with the main-app team.
-
-**Sprint 2 (4 May – 15 May): Commission engine and integration**
-- Onboarding bonus trigger, monthly commission batch (xxl-job), admin verification and suspension flows.
-- Promoter app endpoints — barcode display, pharmacy list, earnings breakdown.
-- Main-app integration: order settlement event consumer, commission-finalized event publisher.
-- Frontend integration, QA, UAT.
-- Demo 15 May.
-
-**UAT hardening (15 May – 20 May)**
-- Bug fixes, performance benchmarking, backup/restore drill, security review.
-- Production launch 20 May.
+The one exception: **`inviter_commission_rate_config_history`** is a DB table because the
+PRD §5.5 explicitly requires the admin rate-config page to display a historical view, and
+serving that from Kibana would be both heavier and less reliable than reading from a small
+table.
 
 ---
 
-## 10. Top Risks
+## 7. Security
 
-**Main-app integration scope and contract ownership.** The interface between HPMS and the main app (events, payloads, identity mapping) must be agreed early. Slippage here cascades to commission delivery and promoter payout. This is now the highest-priority risk.
+All inherited from `mall-parent`:
 
-**Commission correctness under edge cases.** Mid-month suspension, pharmacy reassignment, and cross-region scenarios remain under-specified in the PRD. Open questions need closure by 23 April or dependent work stalls.
+- JWT HS256 via the existing auth flow
+- BCrypt password hashing
+- Spring Security + `@PreAuthorize` at controllers
+- Per-environment CORS
+- Rate limiting (existing patterns)
 
-**Contract drift between frontend and backend.** If the OpenAPI contract is not frozen by 24 April, Sprint 2 integration time suffers disproportionately.
+HPMS-specific concerns:
 
-**Single-engineer backend capacity.** Any blocker on the primary backend engineer stalls all dependent work. Optional second engineer confirmation this week would materially reduce Sprint 2 risk.
+- Invitation codes are public-by-design (printed on QR codes, shared) — no additional
+  protection. Suspension of a user deactivates their code via a status flag; subsequent
+  scans of a deactivated code reject at the userms validation step.
+- Commission rate-config endpoints are admin-only (`@PreAuthorize` + service-layer
+  re-check).
+- The `inviter_commission_record` table contains money figures by user — standard
+  RBAC on read endpoints.
 
 ---
 
-*Document end. v0.4 — 21 April 2026.*
+## 8. Out of scope (Phase 1 MVP)
+
+Per [MSC_HPMS_PRD_v3.0.md §9](./MSC_HPMS_PRD_v3.0.md):
+
+- System-level role distinction between field promoters and external Inviters (managed
+  offline; soft tag is for reporting only).
+- Multi-level cascading commissions (single-level only by design).
+- Salary payroll integration (offline by MSC HR).
+- B2B tiered promotion + virtual badges (deferred).
+- Push notifications for commission events.
+- Advanced cohort analytics.
+- Direct payment disbursement (commission lands in the existing balance — withdrawals
+  follow the existing flow).
+
+---
+
+## 9. Delivery plan
+
+Timeline being reassessed after the scope change (PRD v3.0 Open Question Q1). Working
+estimates pending re-plan:
+
+- **Phase 1 — userms additions:** invitation code generation, binding, registration
+  extension, admin tag endpoints. ~3-5 days.
+- **Phase 2 — rebate additions:** rate-config CRUD + history, commission record schema,
+  batch handler, admin endpoints. ~5-7 days.
+- **Phase 3 — payment integration:** internal credit endpoint, income type. ~1-2 days.
+- **Phase 4 — mall-job batch wiring:** xxl-job handler + Feign client. ~1 day.
+- **Phase 5 — frontend integration, QA, UAT.** ~5-7 days.
+
+---
+
+## 10. Top risks
+
+1. **Tier-formula correctness across the rate-change boundary.** Settled orders from
+   month N use the rate active when month N's batch runs. If the rate changes mid-month,
+   confusion is possible. The history table + clear admin UX mitigate.
+2. **Idempotency of the batch.** Composite unique on `inviter_commission_record` plus
+   `INSERT ... ON DUPLICATE KEY UPDATE` is the lever; needs explicit tests with re-runs.
+3. **Cross-module Feign chain depth.** Batch goes mall-job → rebate → order + userms.
+   Failures of any leg need clean retries; the batch row's `RUNNING/FAILED/COMPLETED`
+   status is the recovery anchor.
+4. **Suspended Inviter mid-month.** The PRD says suspension freezes accrual immediately
+   and revokes the code. The batch must respect the user's status at the time it runs;
+   "suspended at any point during the month" semantics need a one-line product
+   confirmation (Open question).
+
+---
+
+*Document end. v1.0 — 4 May 2026. Replaces v0.4.*

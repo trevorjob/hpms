@@ -2,8 +2,13 @@
 
 > Hierarchical Promotion Management System · Backend documentation hub
 
-This folder is the single source of truth for HPMS backend design. Read in numbered order
-if you're new; jump directly to a specific doc otherwise.
+This folder is the single source of truth for HPMS backend design. Read in numbered
+order if you're new; jump directly to a specific doc otherwise.
+
+**As of 6 May 2026, HPMS is implemented as additions inside three existing `mall-parent`
+modules — `mall-userms`, `mall-rebate`, `mall-payment` — not as a standalone service.**
+The earlier standalone-service design has been fully replaced. See [01_ARCHITECTURE](./01_ARCHITECTURE.md)
+for the current shape.
 
 ---
 
@@ -11,48 +16,65 @@ if you're new; jump directly to a specific doc otherwise.
 
 | # | Document | What it is | Audience |
 |---|---|---|---|
-| 01 | [Architecture](./01_ARCHITECTURE.md) | Stack choices, module boundaries, system context, deployment | CTO · backend lead · senior engineers |
-| 02 | [Project Context](./02_PROJECT_CONTEXT.md) | Timeline, team, working agreements, anti-patterns, what's next | Anyone joining the project |
-| 03 | [PRD v2.0](./03_PRD_v2.0.pdf) | Product requirements (PM-authored, informational) | All |
-| 04 | [Process Diagrams v1.0](./04_ProcessDiagrams_v1.0.pdf) | Business process flowcharts (PM-authored, informational) | All |
-| 05 | [Data Dictionary v1.0](./05_DataDictionary_v1.0.pdf) | Field-level entity definitions (PM-authored, informational) | All |
-| 06 | [Schema Design](./06_SCHEMA_DESIGN.md) | Database design — entities, integrity, indexes, open questions | CTO · DBA · backend |
-| 07 | [Application Invariants](./07_APPLICATION_INVARIANTS.md) | Business rules enforced in code, with owner + tests | Backend engineers · QA |
-| 08 | [Deviations](./08_DEVIATIONS.md) | Numbered log of every place the implementation diverges from PM docs | CTO · reviewers |
+| 00 | [README](./00_README.md) | This file — index + maintenance guide | All |
+| 01 | [Architecture](./01_ARCHITECTURE.md) | Distributed-module architecture v1.0 | Team lead · backend |
+| 02 | [Project Context](./02_PROJECT_CONTEXT.md) | Timeline, team, decisions made, what's next | Anyone joining the project |
+| — | [PRD v3.0](./MSC_HPMS_PRD_v3.0.md) | **THE AUTHORITATIVE PRODUCT SPEC** | All |
+| 06 | [Schema Design](./06_SCHEMA_DESIGN.md) | DDL for the seven new tables/columns across mall-userms and mall-rebate | Team lead · DBA · backend |
+| 07 | [Application Invariants](./07_APPLICATION_INVARIANTS.md) | Service-layer business rules with owner + tests | Backend · QA |
+| 08 | [Deviations](./08_DEVIATIONS.md) | Numbered log of deliberate divergences from PM docs | Team lead · reviewers |
 
-The PM-authored docs (03–05) are **informational, not authoritative** — see
-[CLAUDE.md](../CLAUDE.md) for the trust-level rule. Where engineering judgement
-overrides the PM docs, the deviation is recorded in 08.
+The previous PM-authored PDFs (PRD v2.0, Process Diagrams v1.0, Data Dictionary v1.0)
+have been moved to [archive/](./archive/) — they describe the v2.0 model (3-tier
+promoter hierarchy, barcodes-as-tree, onboarding bonus) which was abandoned on 30 April
+2026 when [PRD v3.0](./MSC_HPMS_PRD_v3.0.md) was issued. Kept for forensic context only;
+do not implement anything from them.
 
 ---
 
 ## Quick navigation by question
 
-**"Where does this rule live — DB or app?"**
-Schema design [§5](./06_SCHEMA_DESIGN.md#5-integrity-controls) gives the rule-by-rule split.
-For app-layer rules, drill into [07_APPLICATION_INVARIANTS](./07_APPLICATION_INVARIANTS.md).
+**"What does HPMS look like as a system?"**
+[01_ARCHITECTURE](./01_ARCHITECTURE.md) — module distribution, cross-module data flows,
+stack inheritance.
 
-**"Why did we deviate from the data dictionary on X?"**
-[08_DEVIATIONS](./08_DEVIATIONS.md) — search for the field name.
+**"Where does each table live and why?"**
+[06_SCHEMA_DESIGN](./06_SCHEMA_DESIGN.md) — full DDL with annotations, plus the migration
+order.
 
-**"What's blocking the schema being final?"**
-[06_SCHEMA_DESIGN §7](./06_SCHEMA_DESIGN.md#7-open-questions-for-finance-ops-and-integration)
-lists the open Finance/Ops/Integration questions.
+**"Where does this rule live — DB or application?"**
+Schema design [§5](./06_SCHEMA_DESIGN.md#5-integrity-controls) gives the rule-by-rule
+split. Application-layer rules drill into [07_APPLICATION_INVARIANTS](./07_APPLICATION_INVARIANTS.md).
 
-**"What's the commission split for an Agent-onboarded pharmacy?"**
-[06_SCHEMA_DESIGN §4.2](./06_SCHEMA_DESIGN.md#42-split-scenarios) and
-[07_APPLICATION_INVARIANTS I-041](./07_APPLICATION_INVARIANTS.md#i-041--split-matrix).
+**"Why did we deviate from the PRD on X?"**
+[08_DEVIATIONS](./08_DEVIATIONS.md) — search for the topic.
 
-**"Why isn't the bonus amount enforced as a CHECK?"**
-[08_DEVIATIONS D-005](./08_DEVIATIONS.md#d-005--split-percentages-and-bonus-amounts-not-encoded-in-ddl).
+**"What's blocking implementation?"**
+[02_PROJECT_CONTEXT §7](./02_PROJECT_CONTEXT.md#7-open-product-questions-still-outstanding)
+lists open product questions; [06_SCHEMA_DESIGN §8](./06_SCHEMA_DESIGN.md#8-open-questions-for-finance--pm--ops)
+lists schema-blocking ones.
 
-**"What goes in `audit_logs` and what guarantees its immutability?"**
-[06_SCHEMA_DESIGN §3.8 + §5.4](./06_SCHEMA_DESIGN.md#38-audit_logs-append-only) and
-[08_DEVIATIONS D-007](./08_DEVIATIONS.md#d-007--audit_logs-append-only--triggers--grant-defense-in-depth).
+**"What's the commission formula?"**
+[07_APPLICATION_INVARIANTS I-041](./07_APPLICATION_INVARIANTS.md#i-041--tier-formula)
+plus the rate config table in
+[06_SCHEMA_DESIGN §3.1](./06_SCHEMA_DESIGN.md#31-inviter_commission_rate_config--current-active-rates-single-row).
+
+**"Why no audit_logs table?"**
+[08_DEVIATIONS D-003](./08_DEVIATIONS.md#d-003--no-audit_logs-table--kibana-is-the-audit-trail).
 
 **"How does HPMS get order data?"**
-[01_ARCHITECTURE §4.8](./01_ARCHITECTURE.md) (RocketMQ from main app) and
-[06_SCHEMA_DESIGN §3.4 / §3.10](./06_SCHEMA_DESIGN.md) (read-mirror tables).
+Feign call from `mall-rebate` to `mall-order` during the monthly batch — see
+[01_ARCHITECTURE §4.3](./01_ARCHITECTURE.md#43-monthly-commission-batch).
+[08_DEVIATIONS D-013](./08_DEVIATIONS.md#d-013--order-data-is-read-only-via-feign--no-read-mirror-in-hpms).
+
+**"How does commission get paid?"**
+[01_ARCHITECTURE §4.4](./01_ARCHITECTURE.md#44-admin-approves-a-commission-batch--wallet-credit) —
+admin approves → mall-rebate Feign-calls mall-payment to credit the balance with income
+type `Sales Commission`.
+
+**"What's the lifetime-binding rule?"**
+[07_APPLICATION_INVARIANTS I-011](./07_APPLICATION_INVARIANTS.md#i-011--lifetime-binding-unique-violation--silent-ignore)
+plus [08_DEVIATIONS D-008](./08_DEVIATIONS.md#d-008--lifetime-binding-via-unique-then-silent-ignore).
 
 ---
 
@@ -60,46 +82,67 @@ lists the open Finance/Ops/Integration questions.
 
 | Asset | Path |
 |---|---|
-| Initial schema (Flyway) | `src/main/resources/db/migration/V1__init.sql` |
+| HPMS code in mall-userms | `mall-userms/src/main/java/com/yuanfeng/userms/inviter/` (planned package) |
+| HPMS code in mall-rebate | `mall-rebate/src/main/java/com/yuanfeng/rebate/inviter/` (planned package) |
+| HPMS code in mall-payment | folded into existing payment package; new income type code only |
+| HPMS xxl-job handler | `mall-job/src/main/java/com/yuanfeng/job/job/InviterCommissionBatchJob.java` (planned) |
+| Schema DDL | applied manually per module — see [06_SCHEMA_DESIGN §7](./06_SCHEMA_DESIGN.md#7-migration-order-manual-sql) |
 | Project-wide design rules for AI assistants | `CLAUDE.md` (repo root) |
-| All other documentation | this folder (`docs/`) |
+| All design documentation | this folder (`docs/`) |
 
 ---
 
 ## Document conventions
 
-- **Numbered prefixes** (`NN_*.md`) define the canonical reading order.
+- **Numbered prefixes** (`NN_*.md`) define the canonical reading order. New design
+  documents should be added to the next available number.
 - **Cross-references** use relative markdown links so they survive folder moves and
-  render correctly in GitHub/GitLab.
+  render correctly in GitHub/GitLab/Kibana viewers.
 - **Numbered identifiers** are stable references:
   - `D-NNN` — entries in 08_DEVIATIONS
   - `I-NNN` — entries in 07_APPLICATION_INVARIANTS
-  - `Q-NNN` — open questions (currently across 06 and 07; consolidate when answered)
+  - `Q-N` — open questions (currently in 02 and 06; consolidate when answered)
 - **Source-of-truth ranking** when docs disagree:
-  1. The implemented code (`V1__init.sql`, services)
-  2. 08_DEVIATIONS (records why code differs from spec)
-  3. 06_SCHEMA_DESIGN / 07_APPLICATION_INVARIANTS (engineering specs)
-  4. 01_ARCHITECTURE (stack-level decisions)
-  5. PM-authored PDFs (informational)
+  1. The implemented code in the relevant module
+  2. [08_DEVIATIONS](./08_DEVIATIONS.md) (records why code differs from spec)
+  3. [06_SCHEMA_DESIGN](./06_SCHEMA_DESIGN.md) and [07_APPLICATION_INVARIANTS](./07_APPLICATION_INVARIANTS.md)
+  4. [01_ARCHITECTURE](./01_ARCHITECTURE.md)
+  5. [PRD v3.0](./MSC_HPMS_PRD_v3.0.md)
+  6. PM-authored PDFs (03–05) — informational only, superseded by PRD v3.0
 
 ---
 
-## Maintenance
+## Maintenance protocol
 
-When you change the schema or a business rule:
+When you change something:
 
-1. Update `V1__init.sql` (or add a `V2__*.sql` migration).
-2. Update [06_SCHEMA_DESIGN](./06_SCHEMA_DESIGN.md) so the narrative matches.
-3. If the change diverges from the PM docs, add a `D-NNN` entry to
-   [08_DEVIATIONS](./08_DEVIATIONS.md).
-4. If the change moves a rule between layers, update
-   [07_APPLICATION_INVARIANTS](./07_APPLICATION_INVARIANTS.md).
-5. If a Finance/Ops/Integration question gets answered, remove it from the open-questions
-   list and update the relevant entry.
+1. **Schema change** — apply the DDL manually in dev, then update
+   [06_SCHEMA_DESIGN](./06_SCHEMA_DESIGN.md) so the narrative matches.
+2. **Business rule moves between layers** — update
+   [07_APPLICATION_INVARIANTS](./07_APPLICATION_INVARIANTS.md). If it diverges from PRD,
+   add a `D-NNN` entry to [08_DEVIATIONS](./08_DEVIATIONS.md).
+3. **A Finance / Ops / PM question gets answered** — remove it from the open-questions
+   list in 02 and/or 06 and update the relevant rule.
+4. **The PRD changes** — flag the version, capture what changed in
+   [02_PROJECT_CONTEXT](./02_PROJECT_CONTEXT.md), update each affected doc.
 
-The numbered IDs (`D-NNN`, `I-NNN`) never get reused — when something is removed, leave a
-tombstone entry referencing the commit that removed it.
+The numbered IDs (`D-NNN`, `I-NNN`) **never get reused**. When something is removed,
+leave a tombstone entry referencing the commit that removed it. **Note:** the current
+`D-NNN` numbering started fresh on 4 May 2026 with the architecture rewrite — references
+to `D-007` etc. in older artefacts (git history, the team-lead resync brief) refer to a
+different numbering and should be checked by date.
 
 ---
 
-*Last updated: 2026-04-27*
+## Version history
+
+| Date | Change |
+|---|---|
+| 21 Apr 2026 | Initial architecture (v0.4) and v2.0-PRD-based schema docs |
+| 30 Apr 2026 | PRD rewritten to v3.0 (flat Inviter/Invitee model) |
+| 4 May 2026 | Team-lead resync — distributed-module architecture confirmed |
+| 4–6 May 2026 | All design docs rewritten to v1.0 — current state |
+
+---
+
+*Last updated: 6 May 2026.*
